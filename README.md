@@ -27,7 +27,7 @@ python -m app.main
 
 ## Docker / NAS
 
-默认 `docker-compose.yml` 直接使用已经发布到 GHCR 的 v1.1.0 镜像：
+默认 `docker-compose.yml` 直接使用已经发布到 GHCR 的 v1.1.1 镜像：
 
 ```powershell
 docker compose pull

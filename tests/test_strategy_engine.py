@@ -6,6 +6,7 @@ import pandas as pd
 
 from app.strategy_engine import (
     MARKET_ASSETS,
+    _commission,
     _signal_context,
     _trend_snapshot,
     calculate_plan,
@@ -21,6 +22,11 @@ class MemoryStore:
 
 
 class StrategyEngineTests(unittest.TestCase):
+    def test_commission_is_zero_when_no_order_is_needed(self):
+        self.assertEqual(_commission(0.01, 0.00006, 0.3), 0.0)
+        self.assertEqual(_commission(0.009, 0.00006, 0.3), 0.0)
+        self.assertEqual(_commission(100.0, 0.00006, 0.3), 0.3)
+
     def test_hysteresis_holds_previous_state_inside_band(self):
         index = pd.bdate_range("2024-01-01", periods=250)
         inside_band = pd.Series([100.0] * 249 + [102.0], index=index)

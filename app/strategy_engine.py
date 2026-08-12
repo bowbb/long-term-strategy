@@ -214,7 +214,7 @@ def build_market_overview(store: MarketStore, asof: Any) -> list[Dict[str, Any]]
 
 
 def _commission(trade_value: float, rate: float, minimum: float) -> float:
-    if trade_value <= 0:
+    if trade_value <= 0.01:
         return 0.0
     return max(trade_value * rate, minimum)
 
