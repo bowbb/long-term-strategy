@@ -8,6 +8,7 @@ from app.strategy_engine import (
     MARKET_ASSETS,
     _commission,
     _signal_context,
+    _signal_text,
     _trend_snapshot,
     calculate_plan,
 )
@@ -22,6 +23,16 @@ class MemoryStore:
 
 
 class StrategyEngineTests(unittest.TestCase):
+    def test_signal_text_distinguishes_strategy_state_from_holdings(self):
+        self.assertEqual(
+            _signal_text({"action": "hold_previous", "multiplier": 1.0}),
+            "滞回区间内，暂时不动",
+        )
+        self.assertEqual(
+            _signal_text({"action": "hold_previous", "multiplier": 0.0}),
+            "滞回区间内，暂时不动",
+        )
+
     def test_commission_is_zero_when_no_order_is_needed(self):
         self.assertEqual(_commission(0.01, 0.00006, 0.3), 0.0)
         self.assertEqual(_commission(0.009, 0.00006, 0.3), 0.0)
@@ -47,14 +58,38 @@ class StrategyEngineTests(unittest.TestCase):
         self.assertEqual(_trend_snapshot(above, 250, 0.03, 0.0)["multiplier"], 1.0)
         self.assertEqual(_trend_snapshot(below, 250, 0.03, 1.0)["multiplier"], 0.0)
 
-    def test_signal_uses_previous_complete_month_and_next_china_trading_day(self):
-        calendar = pd.bdate_range("2020-01-01", "2021-03-05")
-        store = MemoryStore({"csi300": pd.Series(100.0, index=calendar)})
+    def test_signal_uses_latest_completed_day_and_calculation_day_for_execution(self):
+        calendar = pd.bdate_range("2020-01-01", "2021-03-04")
+        store = MemoryStore({"dividend_low_vol": pd.Series(100.0, index=calendar)})
 
         signal_date, execution_date = _signal_context(store, pd.Timestamp("2021-03-05"))
 
-        self.assertEqual(signal_date, pd.Timestamp("2021-02-26"))
-        self.assertEqual(execution_date, pd.Timestamp("2021-03-01"))
+        self.assertEqual(signal_date, pd.Timestamp("2021-03-04"))
+        self.assertEqual(execution_date, pd.Timestamp("2021-03-05"))
+
+    def test_inside_band_uses_current_holding_as_previous_state(self):
+        calendar = pd.bdate_range("2019-01-01", "2021-03-04")
+        flat = pd.Series(100.0, index=calendar)
+        store = MemoryStore({asset: flat for asset in MARKET_ASSETS})
+
+        invested = {
+            "dividend_low_vol": 300.0,
+            "nasdaq100": 0.0,
+            "gold": 0.0,
+            "long_bond": 0.0,
+            "cash": 700.0,
+        }
+        uninvested = dict(invested, dividend_low_vol=0.0, cash=1000.0)
+
+        invested_plan = calculate_plan(store, invested, pd.Timestamp("2021-03-05"))
+        uninvested_plan = calculate_plan(store, uninvested, pd.Timestamp("2021-03-05"))
+
+        self.assertAlmostEqual(invested_plan["target_weights"]["dividend_low_vol"], 0.30)
+        self.assertAlmostEqual(uninvested_plan["target_weights"]["dividend_low_vol"], 0.0)
+        invested_row = next(row for row in invested_plan["rows"] if row["asset"] == "dividend_low_vol")
+        uninvested_row = next(row for row in uninvested_plan["rows"] if row["asset"] == "dividend_low_vol")
+        self.assertEqual(invested_row["signal_text"], "滞回区间内，暂时不动")
+        self.assertEqual(uninvested_row["signal_text"], "滞回区间内，暂时不动")
 
     def test_missing_history_moves_entire_base_weight_to_long_bond(self):
         calendar = pd.bdate_range("2019-01-01", "2021-03-05")
@@ -64,9 +99,7 @@ class StrategyEngineTests(unittest.TestCase):
         store = MemoryStore(series)
 
         holdings = {
-            "csi300": 0.0,
             "dividend_low_vol": 0.0,
-            "star50": 0.0,
             "nasdaq100": 0.0,
             "gold": 0.0,
             "long_bond": 0.0,

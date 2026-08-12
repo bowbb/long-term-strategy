@@ -1,8 +1,6 @@
 {
   "base_weights": {
-    "csi300": 0.0,
     "dividend_low_vol": 0.3,
-    "star50": 0.0,
     "nasdaq100": 0.5,
     "gold": 0.1,
     "long_bond": 0.05,

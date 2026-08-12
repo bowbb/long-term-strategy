@@ -5,7 +5,7 @@
   <div>
     <div class="eyebrow">MA250 ±3% HYSTERESIS</div>
     <h1>本次投资计划</h1>
-    <p class="muted">计算日 {{ today }}。正式信号取上一个完整月末，金额按当前总资产计算。</p>
+    <p class="muted">计算日 {{ today }}。信号使用最新已完成交易日数据，金额按当前总资产计算。</p>
   </div>
   <a class="button button-secondary" href="{{ url_for('settings') }}">刷新数据</a>
 </section>
@@ -41,13 +41,13 @@
 
   <section class="panel">
     <div class="panel-head">
-      <div><h2>最新数据概览</h2><p class="muted">概览仅用于核对数据；正式调仓只使用完整月末信号。</p></div>
+      <div><h2>最新数据概览</h2><p class="muted">每日收盘数据完成后更新信号，次日按目标调仓。</p></div>
     </div>
     <div class="table-scroll">
       <table class="data-table compact-table">
         <thead><tr><th>资产</th><th>数据日</th><th>最新价</th><th>MA250下轨</th><th>MA250</th><th>MA250上轨</th></tr></thead>
         <tbody>
-        {% for item in overview %}
+        {% for item in overview if item.asset != 'cash' %}
           <tr>
             <td>{{ item.name }}</td>
             <td>{{ item.latest_date or '-' }}</td>
@@ -66,8 +66,8 @@
 {% if calculation %}
 <section class="summary-grid">
   <div class="summary-item"><span>当前总资产</span><strong>{{ calculation.current_total|money }} 元</strong></div>
-  <div class="summary-item"><span>正式信号日</span><strong>{{ calculation.signal_date }}</strong></div>
-  <div class="summary-item"><span>执行日</span><strong>{{ calculation.execution_date or '下一中国交易日' }}</strong></div>
+  <div class="summary-item"><span>已完成数据日</span><strong>{{ calculation.signal_date }}</strong></div>
+  <div class="summary-item"><span>计划执行日</span><strong>{{ calculation.execution_date }}</strong></div>
   <div class="summary-item"><span>预估佣金</span><strong>{{ calculation.estimated_commission|money }} 元</strong></div>
 </section>
 
@@ -83,7 +83,7 @@
     <table class="data-table result-table">
       <thead>
         <tr>
-          <th>资产</th><th>月末信号</th><th>月末价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
+          <th>资产</th><th>策略状态</th><th>信号价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
           <th>当前比例</th><th>目标比例</th><th>目标金额</th><th>变动金额</th><th>佣金</th><th>动作</th>
         </tr>
       </thead>
@@ -121,9 +121,10 @@
   <section class="panel">
     <div class="panel-head"><h2>正式策略</h2></div>
     <dl class="strategy-list">
-      <div><dt>基础配置</dt><dd>红利低波 30% / 纳斯达克100 50% / 黄金 10% / 境内长期国债 5% / 人民币现金 5%。沪深300和科创50基础权重均为0%。</dd></div>
-      <div><dt>信号</dt><dd>每月末判断：价格高于 MA250 上轨（+3%）切换为100%基础仓位；低于下轨（-3%）切换为空仓；区间内维持上月状态。</dd></div>
-      <div><dt>执行</dt><dd>信号只在月末更新，并在下一个中国交易日调仓。仓位状态只有持有基础仓位或空仓两种。</dd></div>
+      <div><dt>基础配置</dt><dd>红利低波 30% / 纳斯达克100 50% / 黄金 10% / 境内长期国债 5% / 人民币现金 5%。</dd></div>
+      <div><dt>信号</dt><dd>每日判断：价格高于 MA250 上轨（+3%）切换为100%基础仓位；低于下轨（-3%）切换为空仓；区间内按当前输入持仓延续，已持有则继续持有，未持有则继续空仓。</dd></div>
+      <div><dt>首次投入</dt><dd>没有持仓且价格位于滞回区间内时先不买入，后续突破上轨再建立仓位；已经持有的仓位在区间内继续保留。</dd></div>
+      <div><dt>执行</dt><dd>使用最新已完成交易日的信号，在下一个交易日调仓。仓位状态只有持有基础仓位或空仓两种。</dd></div>
       <div><dt>释放资金</dt><dd>风险资产释放部分各50%转入境内长期国债和人民币现金；基础5%国债和5%现金始终保留。</dd></div>
       <div><dt>缺失历史</dt><dd>风险资产有效历史不足250个交易日时，其基础权重全部转入境内长期国债。</dd></div>
     </dl>

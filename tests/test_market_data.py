@@ -114,12 +114,12 @@ class MarketDataTests(unittest.TestCase):
     def test_market_overview_excludes_manual_cash(self):
         store = MemoryStore()
         dates = pd.date_range("2030-01-02", periods=2, freq="D")
-        for asset in ("csi300", "dividend_low_vol", "star50", "nasdaq100", "gold", "long_bond"):
+        for asset in ("dividend_low_vol", "nasdaq100", "gold", "long_bond"):
             store.write_series(asset, pd.Series([100.0, 101.0], index=dates))
 
         overview = build_market_overview(store, dates[-1])
 
-        self.assertEqual(len(overview), 6)
+        self.assertEqual(len(overview), 4)
         self.assertNotIn("cash", {item["asset"] for item in overview})
 
 

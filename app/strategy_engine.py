@@ -13,15 +13,14 @@ APP_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = APP_ROOT / "strategy_config.json"
 
 RISK_ASSETS = (
-    "csi300",
     "dividend_low_vol",
-    "star50",
     "nasdaq100",
     "gold",
 )
 MARKET_ASSETS = RISK_ASSETS + ("long_bond",)
 ALL_ASSETS = MARKET_ASSETS + ("cash",)
 ETF_ASSETS = MARKET_ASSETS
+CALENDAR_ASSET = "dividend_low_vol"
 
 
 def _asset_label(asset: str) -> str:
@@ -96,31 +95,22 @@ def _trend_snapshot(
     return result
 
 
-def _month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
-    if index.empty:
-        return []
-    dates = pd.DatetimeIndex(index).sort_values().unique()
-    return [pd.Timestamp(group.iloc[-1]) for _, group in pd.Series(dates, index=dates).groupby(dates.to_period("M"))]
-
-
 def _signal_context(store: MarketStore, asof: pd.Timestamp) -> tuple[pd.Timestamp, Optional[pd.Timestamp]]:
-    calendar = store.read_series("csi300").sort_index().index
-    completed_month_cutoff = asof.to_period("M").start_time - pd.Timedelta(days=1)
-    eligible = calendar[calendar <= completed_month_cutoff]
+    calendar = store.read_series(CALENDAR_ASSET).sort_index().index
+    eligible = calendar[calendar < asof]
     if eligible.empty:
-        raise RuntimeError("沪深300日历中没有上一个完整月份的数据，无法生成月末信号。")
+        raise RuntimeError("红利低波交易日历中没有早于计算日的已完成数据，无法生成信号。")
 
     signal_date = pd.Timestamp(eligible[-1]).normalize()
-    execution_dates = calendar[calendar > signal_date]
-    execution_date = pd.Timestamp(execution_dates[0]).normalize() if len(execution_dates) else None
+    execution_date = asof.normalize()
     return signal_date, execution_date
 
 
 def _aligned_prices(store: MarketStore, signal_date: pd.Timestamp) -> pd.DataFrame:
-    calendar = store.read_series("csi300").sort_index()
+    calendar = store.read_series(CALENDAR_ASSET).sort_index()
     calendar = calendar.loc[calendar.index <= signal_date].index
     if calendar.empty:
-        raise RuntimeError("沪深300交易日历为空，无法生成策略信号。")
+        raise RuntimeError("红利低波交易日历为空，无法生成策略信号。")
 
     prices = pd.DataFrame(index=calendar)
     for asset in MARKET_ASSETS:
@@ -128,33 +118,6 @@ def _aligned_prices(store: MarketStore, signal_date: pd.Timestamp) -> pd.DataFra
         series = series.loc[series.index <= signal_date]
         prices[asset] = series.reindex(calendar).ffill()
     return prices
-
-
-def _replay_hysteresis(
-    prices: pd.DataFrame,
-    signal_date: pd.Timestamp,
-    slow_days: int,
-    hysteresis_band: float,
-) -> tuple[Dict[str, Dict[str, Any]], Dict[str, float]]:
-    states: Dict[str, float] = {}
-    final_snapshots: Dict[str, Dict[str, Any]] = {}
-
-    for month_end in _month_end_dates(prices.index[prices.index <= signal_date]):
-        for asset in RISK_ASSETS:
-            snapshot = _trend_snapshot(
-                prices.loc[:month_end, asset],
-                slow_days=slow_days,
-                hysteresis_band=hysteresis_band,
-                previous_multiplier=states.get(asset),
-            )
-            if snapshot["available"]:
-                states[asset] = float(snapshot["multiplier"])
-            if month_end == signal_date:
-                final_snapshots[asset] = snapshot
-
-    if not final_snapshots:
-        raise RuntimeError("未找到可用的完整月末信号。")
-    return final_snapshots, states
 
 
 def _market_snapshot(store: MarketStore, asset: str, asof: pd.Timestamp) -> Dict[str, Any]:
@@ -219,6 +182,19 @@ def _commission(trade_value: float, rate: float, minimum: float) -> float:
     return max(trade_value * rate, minimum)
 
 
+def _signal_text(trend: Mapping[str, Any]) -> str:
+    action = str(trend["action"])
+    if action == "switch_on":
+        return "突破上轨，策略转为持有"
+    if action == "switch_off":
+        return "跌破下轨，策略转为空仓"
+    if action == "hold_previous":
+        return "滞回区间内，暂时不动"
+    if action == "initialize_from_ma250":
+        return "首次状态：持有" if float(trend["multiplier"]) == 1.0 else "首次状态：空仓"
+    return "历史不足250日"
+
+
 def calculate_plan(
     store: MarketStore,
     holdings: Mapping[str, Any],
@@ -233,15 +209,19 @@ def calculate_plan(
     commission_rate = float(config["commission_rate"])
     minimum_commission = float(config["minimum_commission"])
     base_weights = {asset: float(config["base_weights"][asset]) for asset in ALL_ASSETS}
+    normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
 
     signal_date, execution_date = _signal_context(store, timestamp)
     prices = _aligned_prices(store, signal_date)
-    final_snapshots, _ = _replay_hysteresis(
-        prices,
-        signal_date,
-        slow_days=slow_days,
-        hysteresis_band=hysteresis_band,
-    )
+    final_snapshots = {
+        asset: _trend_snapshot(
+            prices[asset],
+            slow_days=slow_days,
+            hysteresis_band=hysteresis_band,
+            previous_multiplier=1.0 if normalized_holdings[asset] > 0.0 else 0.0,
+        )
+        for asset in RISK_ASSETS
+    }
 
     target_weights = dict(base_weights)
     released_weight = 0.0
@@ -292,18 +272,9 @@ def calculate_plan(
         raise RuntimeError("目标权重计算失败。")
     target_weights = {asset: weight / total_weight for asset, weight in target_weights.items()}
 
-    normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
     current_total = sum(normalized_holdings.values())
     rows: list[Dict[str, Any]] = []
     total_commission = 0.0
-    action_labels = {
-        "switch_on": "高于上轨，持有",
-        "switch_off": "低于下轨，空仓",
-        "hold_previous": "滞回区间内，维持上月状态",
-        "initialize_from_ma250": "首次进入滞回区间，按MA250初始化",
-        "insufficient_history": "历史不足250日",
-    }
-
     for asset in ALL_ASSETS:
         target_weight = target_weights[asset]
         target_value = current_total * target_weight
@@ -324,7 +295,7 @@ def calculate_plan(
                 "multiplier": trend["multiplier"],
                 "action": trend["action"],
             }
-            signal_text = action_labels[trend["action"]]
+            signal_text = _signal_text(trend)
         elif asset == "long_bond":
             market = _market_snapshot(store, asset, signal_date)
             market.update({"available": True, "multiplier": None, "action": "defensive_asset"})

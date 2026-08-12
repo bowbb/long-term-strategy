@@ -31,26 +31,16 @@ REFRESH_RETRY_DELAY_SECONDS = 60.0
 MAX_REFRESH_RETRIES = 5
 
 ASSET_FILES = {
-    "csi300": "csi300.csv",
     "dividend_low_vol": "dividend_low_vol.csv",
-    "star50": "star50.csv",
     "nasdaq100": "nasdaq100.csv",
     "gold": "gold.csv",
     "long_bond": "long_bond.csv",
 }
 
 ASSET_META = {
-    "csi300": {
-        "label": "沪深300",
-        "source": "腾讯前复权 510300；Yahoo/新浪/东方财富备用，历史种子为沪深300长期代理",
-    },
     "dividend_low_vol": {
         "label": "红利低波",
         "source": "腾讯前复权 512890；Yahoo/新浪/东方财富备用，历史种子为红利低波指数序列",
-    },
-    "star50": {
-        "label": "科创50",
-        "source": "腾讯前复权 588000；Yahoo/新浪/东方财富备用，正式历史不足时不补造代理",
     },
     "nasdaq100": {
         "label": "纳斯达克100",
@@ -108,10 +98,10 @@ class MarketStore:
     def ensure_store(self) -> None:
         self.price_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # Cash is a manual input now; remove the old generated cash price proxy.
-        legacy_cash_path = self.price_dir / "cash.csv"
-        if legacy_cash_path.exists():
-            legacy_cash_path.unlink()
+        active_files = set(ASSET_FILES.values()) | {"usd_cny.csv", "qqq_usd.csv", "gld_usd.csv"}
+        for cached_path in self.price_dir.glob("*.csv"):
+            if cached_path.name not in active_files:
+                cached_path.unlink()
         for asset, filename in ASSET_FILES.items():
             target = self.price_dir / filename
             seed = SEED_DIR / filename
@@ -126,12 +116,58 @@ class MarketStore:
             )
         if not self.refresh_log_path.exists():
             self._atomic_json(self.refresh_log_path, [])
+        self._migrate_runtime_state()
 
     def _atomic_json(self, path: Path, value: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(path.suffix + ".tmp")
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temp, path)
+
+    def _migrate_runtime_state(self) -> None:
+        active_assets = set(ASSET_META)
+        if self.input_path.exists():
+            try:
+                raw_input = json.loads(self.input_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raw_input = {}
+            if isinstance(raw_input, dict):
+                filtered_input = {key: value for key, value in raw_input.items() if key in active_assets}
+                if filtered_input != raw_input:
+                    self._atomic_json(self.input_path, filtered_input)
+
+        if self.calculation_path.exists():
+            try:
+                calculation = json.loads(self.calculation_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                calculation = None
+            rows = calculation.get("rows", []) if isinstance(calculation, dict) else []
+            if any(isinstance(row, dict) and row.get("asset") not in active_assets for row in rows):
+                self.calculation_path.unlink()
+
+        allowed_refresh_names = set(ASSET_FILES) | {"usd_cny", "qqq_usd", "gld_usd", "refresh_task"}
+        try:
+            refresh_entries = json.loads(self.refresh_log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            refresh_entries = []
+        changed = False
+        if isinstance(refresh_entries, list):
+            for entry in refresh_entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("items"), list):
+                    continue
+                items = [
+                    item
+                    for item in entry["items"]
+                    if isinstance(item, dict) and item.get("name") in allowed_refresh_names
+                ]
+                if items != entry["items"]:
+                    entry["items"] = items
+                    entry["success_count"] = sum(item.get("status") == "success" for item in items)
+                    entry["warning_count"] = sum(item.get("status") == "warning" for item in items)
+                    entry["error_count"] = sum(item.get("status") == "error" for item in items)
+                    changed = True
+            if changed:
+                self._atomic_json(self.refresh_log_path, refresh_entries)
 
     def _path_for(self, name: str) -> Path:
         return self.price_dir / ASSET_FILES.get(name, f"{name}.csv")
@@ -212,15 +248,11 @@ class MarketStore:
         for entry in value:
             if not isinstance(entry, dict):
                 continue
-            # Cash is a local input series and has never been a remote refresh task.
             raw_items = entry.get("items", [])
             if not isinstance(raw_items, list):
                 raw_items = []
-            items = [
-                item
-                for item in raw_items
-                if isinstance(item, dict) and item.get("name") != "cash"
-            ]
+            allowed_names = set(ASSET_FILES) | {"usd_cny", "qqq_usd", "gld_usd", "refresh_task"}
+            items = [item for item in raw_items if isinstance(item, dict) and item.get("name") in allowed_names]
             entry = dict(entry)
             entry["items"] = items
             entry["success_count"] = sum(item.get("status") == "success" for item in items)
@@ -239,7 +271,7 @@ class MarketStore:
             value = json.loads(self.input_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return {str(key): float(raw) for key, raw in value.items()}
+        return {str(key): float(raw) for key, raw in value.items() if key in ASSET_META}
 
     def save_portfolio_input(self, values: dict[str, float]) -> None:
         self._atomic_json(self.input_path, values)
@@ -695,9 +727,7 @@ def _refresh_all(data_dir: Path | None = None) -> dict[str, object]:
 
     tasks: list[tuple[str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]]]] = []
     domestic = [
-        ("csi300", "510300"),
         ("dividend_low_vol", "512890"),
-        ("star50", "588000"),
         ("long_bond", "511260"),
     ]
     for asset, code in domestic:
