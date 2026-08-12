@@ -54,12 +54,13 @@ docker compose -f docker-compose.local.yml up -d --build
 ## 数据口径
 
 - 沪深300、红利低波、科创50、境内长期国债：分别使用场内 ETF `510300`、`512890`、`588000`、`511260`。境内日线按“腾讯财经前复权 -> Yahoo Finance 复权价 -> 新浪财经 -> 东方财富”的顺序回退；这与 [a-stock-data 的数据源分层建议](https://github.com/simonlin1212/a-stock-data/blob/main/SKILL.md)一致，避免单一东方财富接口暂时拒绝连接时只能使用旧缓存。
-- 纳斯达克100：Yahoo Finance 的 QQQ 复权价乘 FRED `DEXCHUS`，按人民币计算。
-- 黄金：Yahoo Finance 的 GLD 复权价乘 FRED `DEXCHUS`，按人民币计算。
+- 纳斯达克100：Yahoo Finance 的 QQQ 复权价乘 USD/CNY，按人民币计算。
+- 黄金：Yahoo Finance 的 GLD 复权价乘 USD/CNY，按人民币计算。
+- USD/CNY 按“Yahoo Finance `CNY=X` -> ECB 官方历史参考汇率 -> [Frankfurter ECB reference rates](https://frankfurter.dev/v1/) -> FRED `DEXCHUS`”依次回退；只要任一远程源成功就记录实际来源并视为成功，只有全部远程源失败且沿用本地缓存时才显示警告。ECB 参考汇率说明见 [ECB reference rates](https://data.ecb.europa.eu/data/data-categories/ecbeurosystem-policy_and_exchange_rates/exchange-rates/reference-rates)。
 - 现金：保留 `v1test` 的本地现金收益代理，不作为风险资产择时信号。
 - 现金不参与远程刷新；它只读取本地 `data/prices/cash.csv`，因此不会因为现金数据产生网络请求或刷新失败。
 - 境内长期国债不是美债。511260 上市前的历史沿用 `v1test` 已归档的长期国债指数/公开锚点代理；刷新只会合并新的 511260 数据，不会伪造上市前的场内 ETF 历史。
 
 刷新时会以本地历史序列最近 20 个重叠交易日的中位数比例校准新来源的价格尺度，再只追加更晚日期。这样既能接入真实 ETF 的最新交易日，也不会把 ETF 的价格单位直接拼到历史指数代理上。
 
-远程接口可能限流、改字段或暂时不可访问。刷新任务按顺序执行，当前是 7 个远程数据任务，不会同时发起 10 个请求；定时刷新和手动刷新也由全局锁串行化。首轮完成后只对失败项等待 1 分钟再试，最多重试 5 次，成功项不会重复请求。刷新失败会保留上一份本地文件，并在设置页标记为警告；没有本地数据时才标记为失败。历史刷新时间在网页中统一显示为 UTC+8。实际交易仍需人工核对 ETF 的 IOPV、溢价/折价、流动性、汇率成本和交易权限。
+远程接口可能限流、改字段或暂时不可访问。刷新任务按顺序执行，当前是 7 个远程数据任务，不会同时发起 10 个请求；每个任务内部的数据源也按顺序回退，不会并发请求多个源。定时刷新和手动刷新也由全局锁串行化。首轮完成后只对失败项等待 1 分钟再试，最多重试 5 次，成功项不会重复请求。刷新失败会保留上一份本地文件，并在设置页标记为警告；没有本地数据时才标记为失败。历史刷新时间在网页中统一显示为 UTC+8。实际交易仍需人工核对 ETF 的 IOPV、溢价/折价、流动性、汇率成本和交易权限。

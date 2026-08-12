@@ -6,9 +6,10 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Callable
+from zipfile import ZipFile
 
 import pandas as pd
 import requests
@@ -23,6 +24,8 @@ TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketDataService.getKLineData"
 YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRANKFURTER_TIMESERIES_URL = "https://api.frankfurter.dev/v1/{start}.."
+ECB_HISTORICAL_ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
 CN_TIMEZONE = "Asia/Shanghai"
 REFRESH_RETRY_DELAY_SECONDS = 60.0
 MAX_REFRESH_RETRIES = 5
@@ -52,11 +55,11 @@ ASSET_META = {
     },
     "nasdaq100": {
         "label": "纳斯达克100",
-        "source": "Yahoo Finance QQQ 复权价乘 FRED DEXCHUS，换算为人民币",
+        "source": "Yahoo Finance QQQ 复权价乘多源 USD/CNY，换算为人民币",
     },
     "gold": {
         "label": "黄金",
-        "source": "Yahoo Finance GLD 复权价乘 FRED DEXCHUS，换算为人民币",
+        "source": "Yahoo Finance GLD 复权价乘多源 USD/CNY，换算为人民币",
     },
     "long_bond": {
         "label": "境内长期国债",
@@ -463,6 +466,83 @@ def fetch_fred_series(
     return series
 
 
+def fetch_frankfurter_usd_cny(
+    session: requests.Session, start: str = "2005-01-01"
+) -> pd.Series:
+    payload = _request_json(
+        session,
+        FRANKFURTER_TIMESERIES_URL.format(start=start),
+        {"base": "USD", "symbols": "CNY"},
+    )
+    rates = payload.get("rates")
+    if not isinstance(rates, dict):
+        raise RuntimeError("Frankfurter response has no rates")
+    values: dict[pd.Timestamp, float] = {}
+    for date_value, row in rates.items():
+        if not isinstance(row, dict):
+            continue
+        value = pd.to_numeric(row.get("CNY"), errors="coerce")
+        date = pd.to_datetime(date_value, errors="coerce")
+        if pd.notna(date) and pd.notna(value) and float(value) > 0:
+            values[pd.Timestamp(date).normalize()] = float(value)
+    series = _completed_daily_series(pd.Series(values, dtype=float))
+    if series.empty:
+        raise RuntimeError("Frankfurter returned no valid USD/CNY observations")
+    return series
+
+
+def fetch_ecb_usd_cny(session: requests.Session) -> pd.Series:
+    response = session.get(ECB_HISTORICAL_ZIP_URL, timeout=20)
+    response.raise_for_status()
+    with ZipFile(BytesIO(response.content)) as archive:
+        csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+        if not csv_names:
+            raise RuntimeError("ECB archive has no CSV data")
+        with archive.open(csv_names[0]) as csv_file:
+            frame = pd.read_csv(csv_file)
+
+    columns = {str(column).upper(): column for column in frame.columns}
+    required = {key: columns.get(key) for key in ("DATE", "USD", "CNY")}
+    if any(value is None for value in required.values()):
+        raise RuntimeError("ECB CSV has no Date/USD/CNY columns")
+    dates = pd.to_datetime(frame[required["DATE"]], errors="coerce")
+    usd = pd.to_numeric(frame[required["USD"]], errors="coerce")
+    cny = pd.to_numeric(frame[required["CNY"]], errors="coerce")
+    series = _clean_series(pd.Series(cny.to_numpy() / usd.to_numpy(), index=dates))
+    series = series[(series > 0) & series.notna()]
+    series = _completed_daily_series(series)
+    if series.empty:
+        raise RuntimeError("ECB returned no valid USD/CNY observations")
+    return series
+
+
+def fetch_fx_usd_cny(
+    session: requests.Session, start: str = "2005-01-01"
+) -> tuple[pd.Series, str]:
+    """Fetch USD/CNY from independent providers, stopping at the first usable source."""
+    providers: list[tuple[str, Callable[[], pd.Series]]] = [
+        (
+            "Yahoo Finance CNY=X",
+            lambda: fetch_yahoo_adjusted_close(session, "CNY=X", start),
+        ),
+        ("ECB eurofxref-hist 官方参考汇率", lambda: fetch_ecb_usd_cny(session)),
+        (
+            "Frankfurter ECB reference rates",
+            lambda: fetch_frankfurter_usd_cny(session, start),
+        ),
+        ("FRED DEXCHUS", lambda: fetch_fred_series(session, "DEXCHUS", start)),
+    ]
+    failures: list[str] = []
+    for provider, fetch in providers:
+        try:
+            series = _completed_daily_series(fetch())
+            if not series.empty:
+                return series, provider
+        except Exception as exc:
+            failures.append(f"{provider}: {exc}")
+    raise RuntimeError(f"所有 USD/CNY 数据源均失败：{'；'.join(failures)}")
+
+
 def _status(
     name: str,
     state: str,
@@ -566,7 +646,11 @@ def _combine_cny_series(
         merged = store.merge_and_write(name, cny)
         dependency_warning = any(item["status"] != "success" for item in dependency_states)
         state = "warning" if dependency_warning else "success"
-        message = "美元价格与 USD/CNY 已合并为人民币序列"
+        fx_source = next(
+            (str(item["source"]) for item in dependency_states if item["name"] == "usd_cny"),
+            "本地 USD/CNY",
+        )
+        message = f"美元价格与 USD/CNY（{fx_source}）已合并为人民币序列"
         if dependency_warning:
             message += "；部分远程依赖使用了本地缓存"
         return _status(name, state, ASSET_META[name]["source"], message, merged, dependency_warning)
@@ -628,8 +712,8 @@ def _refresh_all(data_dir: Path | None = None) -> dict[str, object]:
             (
                 "usd_cny",
                 "USD/CNY",
-                "FRED DEXCHUS",
-                lambda: fetch_fred_series(session, "DEXCHUS"),
+                "Yahoo Finance CNY=X -> ECB -> Frankfurter -> FRED",
+                lambda: fetch_fx_usd_cny(session),
             ),
             (
                 "qqq_usd",
