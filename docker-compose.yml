@@ -1,0 +1,13 @@
+services:
+  strategy-web:
+    build: .
+    image: ${IMAGE_NAME:-long-term-strategy:latest}
+    container_name: long-term-strategy
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

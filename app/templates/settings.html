@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}设置与刷新 - 长期投资策略{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <div class="eyebrow">LOCAL DATA STORE</div>
+    <h1>设置与刷新</h1>
+    <p class="muted">数据写入 Docker 挂载的本地 data 目录，刷新失败时保留上一份可用数据。</p>
+  </div>
+</section>
+
+<section class="settings-grid">
+  <section class="panel">
+    <div class="panel-head"><h2>每日自动刷新</h2></div>
+    <form method="post" action="{{ url_for('save_settings') }}" class="settings-form">
+      <label for="refresh_time">刷新时间（{{ settings.timezone }}）</label>
+      <div class="settings-row">
+        <input id="refresh_time" name="refresh_time" type="time" value="{{ settings.refresh_time }}" required>
+        <button class="button button-primary" type="submit">保存时间</button>
+      </div>
+    </form>
+    <form method="post" action="{{ url_for('refresh') }}" class="manual-refresh-form">
+      <button class="button button-secondary" type="submit">立即刷新全部数据</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>刷新状态</h2></div>
+    {% if logs %}
+      <div class="refresh-summary">
+        <span>最近一次：{{ logs[0].finished_at }}</span>
+        <span class="status status-{{ logs[0].status }}">{{ logs[0].status|status_text }}</span>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table compact-table">
+          <thead><tr><th>数据项</th><th>状态</th><th>最新日期</th><th>说明</th></tr></thead>
+          <tbody>
+          {% for item in logs[0]['items'] %}
+            <tr>
+              <td>{{ item.label }}</td>
+              <td><span class="status status-{{ item.status }}">{{ item.status|status_text }}</span></td>
+              <td>{{ item.latest_date or '-' }}</td>
+              <td>{{ item.message }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="muted">还没有刷新记录。种子数据可以直接用于计算，首次手动刷新后会在这里显示各项状态。</p>
+    {% endif %}
+  </section>
+</section>
+
+<section class="panel history-panel">
+  <div class="panel-head"><h2>历史刷新记录</h2></div>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>完成时间</th><th>总体状态</th><th>成功</th><th>警告</th><th>失败</th></tr></thead>
+      <tbody>
+      {% for item in logs %}
+        <tr>
+          <td>{{ item.finished_at }}</td>
+          <td><span class="status status-{{ item.status }}">{{ item.status|status_text }}</span></td>
+          <td>{{ item.success_count }}</td><td>{{ item.warning_count }}</td><td>{{ item.error_count }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">暂无记录</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

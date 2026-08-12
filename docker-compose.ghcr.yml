@@ -1,0 +1,12 @@
+services:
+  strategy-web:
+    image: ${IMAGE_NAME:?Set IMAGE_NAME in .env}
+    container_name: long-term-strategy
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

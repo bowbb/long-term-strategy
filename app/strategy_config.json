@@ -1,0 +1,12 @@
+{
+  "base_weights": {
+    "csi300": 0.15,
+    "dividend_low_vol": 0.15,
+    "star50": 0.10,
+    "nasdaq100": 0.40,
+    "gold": 0.10,
+    "long_bond": 0.05,
+    "cash": 0.05
+  },
+  "released_to_cash_ratio": 0.50
+}
