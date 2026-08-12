@@ -1,12 +1,13 @@
 # 长期投资策略网页
 
-这是 `v1test` 正式 20/250 日均线基线的轻量网页版本，适合在 NAS 上用 Docker 运行。
+这是 `v1test` 正式 MA250 ±3% 滞回策略的轻量网页版本，适合在 NAS 上用 Docker 运行。
 
 网页提供：
 
 - 手动输入沪深300、红利低波、科创50、纳斯达克100、黄金、境内长期国债和人民币现金的当前市值；
-- 按打开网页当天，使用不晚于当天的最新本地数据计算目标比例、目标金额和增加/减少金额；
-- 展示价格、MA20、MA250、信号得分、释放资金去向和完整计算过程；
+- 使用上一个完整月末的正式信号，计算目标比例、目标金额和增加/减少金额；
+- 展示月末价格、MA250、±3% 上下轨、滞回状态、释放资金去向和完整计算过程；
+- 按 ETF 每笔万 0.6、最低 0.3 元估算交易佣金；
 - 每日定时刷新，以及设置页的立即刷新按钮；
 - 按资产保存刷新成功、警告和失败原因；
 - 所有运行数据写入 `data/`，通过 Docker volume 持久化到 NAS。
@@ -26,7 +27,7 @@ python -m app.main
 
 ## Docker / NAS
 
-默认 `docker-compose.yml` 直接使用已经发布到 GHCR 的 v1 镜像：
+默认 `docker-compose.yml` 直接使用已经发布到 GHCR 的 v1.1.0 镜像：
 
 ```powershell
 docker compose pull
@@ -51,6 +52,14 @@ docker compose -f docker-compose.local.yml up -d --build
 
 建议把 `项目` 文件夹本身作为 Git 仓库根目录上传，这样 `.github/workflows/publish.yml` 会自动生效。镜像名称会按 GitHub 仓库生成：`ghcr.io/<owner>/<repo>`。
 
+## 正式策略
+
+- 基础权重：红利低波 30%、纳斯达克100 50%、黄金 10%、境内长期国债 5%、人民币现金 5%；沪深300和科创50均为 0%。
+- 每个中国交易月末判断一次。风险资产价格高于 `MA250 × 1.03` 时切换为 100% 基础仓位，低于 `MA250 × 0.97` 时切换为空仓；在上下轨之间维持上月状态。
+- 正式信号在下一个中国交易日执行，仓位状态只有持有基础仓位或空仓两种。
+- 风险资产释放的资金各 50% 转入境内长期国债和人民币现金；基础 5% 国债与 5% 现金始终保留。
+- 风险资产有效历史不足 250 个交易日时，其基础权重全部转入境内长期国债。
+
 ## 数据口径
 
 - 沪深300、红利低波、科创50、境内长期国债：分别使用场内 ETF `510300`、`512890`、`588000`、`511260`。境内日线按“腾讯财经前复权 -> Yahoo Finance 复权价 -> 新浪财经 -> 东方财富”的顺序回退；这与 [a-stock-data 的数据源分层建议](https://github.com/simonlin1212/a-stock-data/blob/main/SKILL.md)一致，避免单一东方财富接口暂时拒绝连接时只能使用旧缓存。
@@ -58,7 +67,7 @@ docker compose -f docker-compose.local.yml up -d --build
 - 黄金：Yahoo Finance 的 GLD 复权价乘 USD/CNY，按人民币计算。
 - USD/CNY 按“Yahoo Finance `CNY=X` -> ECB 官方历史参考汇率 -> [Frankfurter ECB reference rates](https://frankfurter.dev/v1/) -> FRED `DEXCHUS`”依次回退；只要任一远程源成功就记录实际来源并视为成功，只有全部远程源失败且沿用本地缓存时才显示警告。ECB 参考汇率说明见 [ECB reference rates](https://data.ecb.europa.eu/data/data-categories/ecbeurosystem-policy_and_exchange_rates/exchange-rates/reference-rates)。
 - 现金：只作为手动输入的人民币金额和 5% 基础防守仓位，不使用价格序列、均线或远程刷新。
-- 升级到 v1.0.2 后，应用启动时会自动清理旧版本生成的 `data/prices/cash.csv`；不会删除网页中手动输入的现金金额。
+- 应用启动时会自动清理旧版本生成的 `data/prices/cash.csv`；不会删除网页中手动输入的现金金额。
 - 境内长期国债不是美债。511260 上市前的历史沿用 `v1test` 已归档的长期国债指数/公开锚点代理；刷新只会合并新的 511260 数据，不会伪造上市前的场内 ETF 历史。
 
 刷新时会以本地历史序列最近 20 个重叠交易日的中位数比例校准新来源的价格尺度，再只追加更晚日期。这样既能接入真实 ETF 的最新交易日，也不会把 ETF 的价格单位直接拼到历史指数代理上。

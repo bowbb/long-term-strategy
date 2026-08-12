@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, flash, redirect, render_template, request, url_for
 
 from .market_data import ASSET_META, MarketStore, refresh_all
-from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan
+from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan, load_config
 
 
 app = Flask(__name__)
@@ -171,6 +171,7 @@ def _dashboard(calculation=None, values=None, error=None):
         today=today.strftime("%Y-%m-%d"),
         error=error,
         asset_meta=ASSET_META,
+        base_weights=load_config()["base_weights"],
     )
 
 

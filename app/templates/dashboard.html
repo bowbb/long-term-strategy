@@ -3,9 +3,9 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <div class="eyebrow">20/250 MA BASELINE</div>
+    <div class="eyebrow">MA250 ±3% HYSTERESIS</div>
     <h1>本次投资计划</h1>
-    <p class="muted">计算日 {{ today }}。金额按当前总资产计算，现金输入应包含本次准备投入的工资。</p>
+    <p class="muted">计算日 {{ today }}。正式信号取上一个完整月末，金额按当前总资产计算。</p>
   </div>
   <a class="button button-secondary" href="{{ url_for('settings') }}">刷新数据</a>
 </section>
@@ -19,7 +19,7 @@
     <div class="panel-head">
       <div>
         <h2>当前持仓与现金</h2>
-        <p class="muted">填写各类资产当前市值，不填按 0 计算。</p>
+        <p class="muted">填写各类资产当前市值，现金应包含本次准备投入的资金。</p>
       </div>
       <button class="button button-primary" type="submit">计算目标</button>
     </div>
@@ -31,7 +31,7 @@
           <tr>
             <td><strong>{{ meta.label }}</strong><span class="cell-note">{{ asset }}</span></td>
             <td><input class="amount-input" type="number" min="0" step="0.01" name="holding_{{ asset }}" value="{{ values[asset] }}" inputmode="decimal"></td>
-            <td>{{ ({'csi300': 0.15, 'dividend_low_vol': 0.15, 'star50': 0.10, 'nasdaq100': 0.40, 'gold': 0.10, 'long_bond': 0.05, 'cash': 0.05})[asset]|pct }}</td>
+            <td>{{ base_weights[asset]|pct }}</td>
           </tr>
         {% endfor %}
         </tbody>
@@ -41,19 +41,20 @@
 
   <section class="panel">
     <div class="panel-head">
-      <div><h2>最新数据概览</h2><p class="muted">均线使用不晚于计算日的本地数据。</p></div>
+      <div><h2>最新数据概览</h2><p class="muted">概览仅用于核对数据；正式调仓只使用完整月末信号。</p></div>
     </div>
     <div class="table-scroll">
       <table class="data-table compact-table">
-        <thead><tr><th>资产</th><th>数据日</th><th>最新价</th><th>MA20</th><th>MA250</th></tr></thead>
+        <thead><tr><th>资产</th><th>数据日</th><th>最新价</th><th>MA250下轨</th><th>MA250</th><th>MA250上轨</th></tr></thead>
         <tbody>
         {% for item in overview %}
           <tr>
-            <td>{{ item.label }}</td>
+            <td>{{ item.name }}</td>
             <td>{{ item.latest_date or '-' }}</td>
             <td>{{ item.latest|number }}</td>
-            <td>{{ item.ma20|number }}</td>
+            <td>{{ item.lower_bound|number }}</td>
             <td>{{ item.ma250|number }}</td>
+            <td>{{ item.upper_bound|number }}</td>
           </tr>
         {% endfor %}
         </tbody>
@@ -65,48 +66,42 @@
 {% if calculation %}
 <section class="summary-grid">
   <div class="summary-item"><span>当前总资产</span><strong>{{ calculation.current_total|money }} 元</strong></div>
-  <div class="summary-item"><span>非现金增加</span><strong>{{ calculation.non_cash_increase|money }} 元</strong></div>
-  <div class="summary-item"><span>非现金减少</span><strong>{{ calculation.non_cash_decrease|money }} 元</strong></div>
-  <div class="summary-item"><span>现金目标变动</span><strong>{{ calculation.cash_change|signed_money }} 元</strong></div>
+  <div class="summary-item"><span>正式信号日</span><strong>{{ calculation.signal_date }}</strong></div>
+  <div class="summary-item"><span>执行日</span><strong>{{ calculation.execution_date or '下一中国交易日' }}</strong></div>
+  <div class="summary-item"><span>预估佣金</span><strong>{{ calculation.estimated_commission|money }} 元</strong></div>
 </section>
 
 <section class="panel result-panel">
   <div class="panel-head">
     <div>
       <h2>目标权重与交易金额</h2>
-      <p class="muted">目标金额 = 当前总资产 × 目标权重；正数表示增加，负数表示减少。</p>
+      <p class="muted">正数表示增加，负数表示减少；佣金按 ETF 每笔万0.6、最低0.3元估算，并应从现金中预留。</p>
     </div>
-    <span class="tag">信号日 {{ calculation.calculation_date }}</span>
+    <span class="tag">信号日 {{ calculation.signal_date }}</span>
   </div>
   <div class="table-scroll">
     <table class="data-table result-table">
       <thead>
         <tr>
-          <th>资产</th><th>信号</th><th>最新价</th><th>MA20</th><th>MA250</th>
-          <th>当前比例</th><th>目标比例</th><th>目标金额</th><th>变动金额</th><th>动作</th>
+          <th>资产</th><th>月末信号</th><th>月末价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
+          <th>当前比例</th><th>目标比例</th><th>目标金额</th><th>变动金额</th><th>佣金</th><th>动作</th>
         </tr>
       </thead>
       <tbody>
       {% for row in calculation.rows %}
         <tr>
-          <td><strong>{{ row.label }}</strong><span class="cell-note">{{ row.asset }}</span></td>
-          <td>
-            {% if row.asset in ['cash', 'long_bond'] %}
-              防守仓位
-            {% elif row.trend.available %}
-              {{ row.trend.conditions }}/2 · {{ row.trend.multiplier|pct }}
-            {% else %}
-              历史不足
-            {% endif %}
-          </td>
-          <td>{{ row.latest|number }}</td>
-          <td>{{ row.ma20|number }}</td>
-          <td>{{ row.ma250|number }}</td>
+          <td><strong>{{ row.name }}</strong><span class="cell-note">{{ row.asset }}</span></td>
+          <td>{{ row.signal_text }}</td>
+          <td>{{ row.market.latest|number }}</td>
+          <td>{{ row.market.lower_bound|number }}</td>
+          <td>{{ row.market.ma250|number }}</td>
+          <td>{{ row.market.upper_bound|number }}</td>
           <td>{{ row.current_weight|pct }}</td>
           <td>{{ row.target_weight|pct }}</td>
           <td>{{ row.target_value|money }}</td>
-          <td class="{% if row.delta_value > 0.01 %}positive{% elif row.delta_value < -0.01 %}negative{% endif %}">{{ row.delta_value|signed_money }}</td>
-          <td><span class="action action-{{ row.action }}">{{ row.action }}</span></td>
+          <td class="{% if row.trade_value > 0.01 %}positive{% elif row.trade_value < -0.01 %}negative{% endif %}">{{ row.trade_value|signed_money }}</td>
+          <td>{{ row.commission|money }}</td>
+          <td>{{ row.trade_action }}</td>
         </tr>
       {% endfor %}
       </tbody>
@@ -118,16 +113,19 @@
   <section class="panel">
     <div class="panel-head"><h2>计算过程</h2></div>
     <ol class="process-list">
-      {% for line in calculation.process %}<li>{{ line }}</li>{% endfor %}
+      {% for item in calculation.process %}
+        <li>{{ item.name }}：基础 {{ item.base_weight|pct }} × 状态 {{ item.multiplier|pct }}；释放 {{ item.released_weight|pct }}。{{ item.destination }}。</li>
+      {% endfor %}
     </ol>
   </section>
   <section class="panel">
     <div class="panel-head"><h2>正式策略</h2></div>
     <dl class="strategy-list">
-      <div><dt>基础配置</dt><dd>沪深300 15% / 红利低波 15% / 科创50 10% / 纳斯达克100 40% / 黄金 10% / 境内长期国债 5% / 现金 5%</dd></div>
-      <div><dt>信号</dt><dd>价格高于 MA250 得1分，MA20 高于 MA250 得1分；2分持有100%，1分持有50%，0分持有0%。</dd></div>
-      <div><dt>释放资金</dt><dd>50% 转境内长期国债，50% 转人民币现金；基础的5%债券和5%现金仍保留。</dd></div>
-      <div><dt>缺失历史</dt><dd>风险资产有效历史不足250个交易日时，其基础权重转入境内长期国债。</dd></div>
+      <div><dt>基础配置</dt><dd>红利低波 30% / 纳斯达克100 50% / 黄金 10% / 境内长期国债 5% / 人民币现金 5%。沪深300和科创50基础权重均为0%。</dd></div>
+      <div><dt>信号</dt><dd>每月末判断：价格高于 MA250 上轨（+3%）切换为100%基础仓位；低于下轨（-3%）切换为空仓；区间内维持上月状态。</dd></div>
+      <div><dt>执行</dt><dd>信号只在月末更新，并在下一个中国交易日调仓。仓位状态只有持有基础仓位或空仓两种。</dd></div>
+      <div><dt>释放资金</dt><dd>风险资产释放部分各50%转入境内长期国债和人民币现金；基础5%国债和5%现金始终保留。</dd></div>
+      <div><dt>缺失历史</dt><dd>风险资产有效历史不足250个交易日时，其基础权重全部转入境内长期国债。</dd></div>
     </dl>
   </section>
 </section>

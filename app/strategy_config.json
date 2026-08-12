@@ -1,12 +1,16 @@
 {
   "base_weights": {
-    "csi300": 0.15,
-    "dividend_low_vol": 0.15,
-    "star50": 0.10,
-    "nasdaq100": 0.40,
-    "gold": 0.10,
+    "csi300": 0.0,
+    "dividend_low_vol": 0.3,
+    "star50": 0.0,
+    "nasdaq100": 0.5,
+    "gold": 0.1,
     "long_bond": 0.05,
     "cash": 0.05
   },
-  "released_to_cash_ratio": 0.50
+  "slow_ma_days": 250,
+  "hysteresis_band": 0.03,
+  "released_to_cash_ratio": 0.5,
+  "commission_rate": 0.00006,
+  "minimum_commission": 0.3
 }

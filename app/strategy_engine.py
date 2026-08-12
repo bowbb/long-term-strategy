@@ -1,233 +1,381 @@
 from __future__ import annotations
 
 import json
-from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Mapping, Optional
 
 import pandas as pd
 
 from .market_data import ASSET_META, MarketStore
 
 
-APP_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = APP_ROOT / "app" / "strategy_config.json"
-RISK_ASSETS = ("csi300", "dividend_low_vol", "star50", "nasdaq100", "gold")
+APP_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = APP_ROOT / "strategy_config.json"
+
+RISK_ASSETS = (
+    "csi300",
+    "dividend_low_vol",
+    "star50",
+    "nasdaq100",
+    "gold",
+)
 MARKET_ASSETS = RISK_ASSETS + ("long_bond",)
 ALL_ASSETS = MARKET_ASSETS + ("cash",)
+ETF_ASSETS = MARKET_ASSETS
 
 
-def load_config() -> dict[str, Any]:
+def _asset_label(asset: str) -> str:
+    return str(ASSET_META[asset]["label"])
+
+
+def load_config() -> Dict[str, Any]:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-def _as_float(value: object) -> float | None:
-    return None if value is None or pd.isna(value) else float(value)
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _trend_snapshot(series: pd.Series, fast_days: int, slow_days: int) -> dict[str, Any]:
-    observed = pd.to_numeric(series, errors="coerce").dropna()
-    result: dict[str, Any] = {
+def _trend_snapshot(
+    series: pd.Series,
+    slow_days: int,
+    hysteresis_band: float,
+    previous_multiplier: Optional[float],
+) -> Dict[str, Any]:
+    observed = series.dropna().astype(float)
+    result: Dict[str, Any] = {
         "available": False,
-        "reason": "有效历史不足250个交易日",
-        "observations": int(len(observed)),
+        "reason": "insufficient_history",
         "latest": None,
-        "latest_date": None,
-        "fast_ma": None,
-        "slow_ma": None,
-        "conditions": 0,
+        "ma250": None,
+        "lower_bound": None,
+        "upper_bound": None,
+        "observations": int(len(observed)),
         "multiplier": 0.0,
+        "action": "insufficient_history",
     }
-    if not observed.empty:
-        result["latest"] = float(observed.iloc[-1])
-        result["latest_date"] = pd.Timestamp(observed.index[-1]).strftime("%Y-%m-%d")
+    if observed.empty:
+        return result
+
+    result["latest"] = float(observed.iloc[-1])
     if len(observed) < slow_days:
         return result
+
     latest = float(observed.iloc[-1])
-    fast_ma = float(observed.iloc[-fast_days:].mean())
-    slow_ma = float(observed.iloc[-slow_days:].mean())
-    conditions = int(latest > slow_ma) + int(fast_ma > slow_ma)
+    ma250 = float(observed.iloc[-slow_days:].mean())
+    lower_bound = ma250 * (1.0 - hysteresis_band)
+    upper_bound = ma250 * (1.0 + hysteresis_band)
+
+    if latest > upper_bound:
+        multiplier = 1.0
+        action = "switch_on"
+    elif latest < lower_bound:
+        multiplier = 0.0
+        action = "switch_off"
+    elif previous_multiplier is None:
+        multiplier = 1.0 if latest > ma250 else 0.0
+        action = "initialize_from_ma250"
+    else:
+        multiplier = float(previous_multiplier)
+        action = "hold_previous"
+
+    result.update(
+        {
+            "available": True,
+            "reason": None,
+            "ma250": ma250,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "multiplier": multiplier,
+            "action": action,
+        }
+    )
+    return result
+
+
+def _month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
+    if index.empty:
+        return []
+    dates = pd.DatetimeIndex(index).sort_values().unique()
+    return [pd.Timestamp(group.iloc[-1]) for _, group in pd.Series(dates, index=dates).groupby(dates.to_period("M"))]
+
+
+def _signal_context(store: MarketStore, asof: pd.Timestamp) -> tuple[pd.Timestamp, Optional[pd.Timestamp]]:
+    calendar = store.read_series("csi300").sort_index().index
+    completed_month_cutoff = asof.to_period("M").start_time - pd.Timedelta(days=1)
+    eligible = calendar[calendar <= completed_month_cutoff]
+    if eligible.empty:
+        raise RuntimeError("沪深300日历中没有上一个完整月份的数据，无法生成月末信号。")
+
+    signal_date = pd.Timestamp(eligible[-1]).normalize()
+    execution_dates = calendar[calendar > signal_date]
+    execution_date = pd.Timestamp(execution_dates[0]).normalize() if len(execution_dates) else None
+    return signal_date, execution_date
+
+
+def _aligned_prices(store: MarketStore, signal_date: pd.Timestamp) -> pd.DataFrame:
+    calendar = store.read_series("csi300").sort_index()
+    calendar = calendar.loc[calendar.index <= signal_date].index
+    if calendar.empty:
+        raise RuntimeError("沪深300交易日历为空，无法生成策略信号。")
+
+    prices = pd.DataFrame(index=calendar)
+    for asset in MARKET_ASSETS:
+        series = store.read_series(asset).sort_index()
+        series = series.loc[series.index <= signal_date]
+        prices[asset] = series.reindex(calendar).ffill()
+    return prices
+
+
+def _replay_hysteresis(
+    prices: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    slow_days: int,
+    hysteresis_band: float,
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, float]]:
+    states: Dict[str, float] = {}
+    final_snapshots: Dict[str, Dict[str, Any]] = {}
+
+    for month_end in _month_end_dates(prices.index[prices.index <= signal_date]):
+        for asset in RISK_ASSETS:
+            snapshot = _trend_snapshot(
+                prices.loc[:month_end, asset],
+                slow_days=slow_days,
+                hysteresis_band=hysteresis_band,
+                previous_multiplier=states.get(asset),
+            )
+            if snapshot["available"]:
+                states[asset] = float(snapshot["multiplier"])
+            if month_end == signal_date:
+                final_snapshots[asset] = snapshot
+
+    if not final_snapshots:
+        raise RuntimeError("未找到可用的完整月末信号。")
+    return final_snapshots, states
+
+
+def _market_snapshot(store: MarketStore, asset: str, asof: pd.Timestamp) -> Dict[str, Any]:
+    config = load_config()
+    slow_days = int(config["slow_ma_days"])
+    hysteresis_band = float(config["hysteresis_band"])
+    try:
+        series = store.read_series(asset).sort_index()
+    except Exception as exc:
+        return {
+            "asset": asset,
+            "name": _asset_label(asset),
+            "error": str(exc),
+            "latest": None,
+            "latest_date": None,
+            "stale": True,
+            "ma250": None,
+            "lower_bound": None,
+            "upper_bound": None,
+            "observations": 0,
+        }
+
+    series = series.loc[series.index <= asof]
+    if series.empty:
+        return {
+            "asset": asset,
+            "name": _asset_label(asset),
+            "error": "所选日期之前没有数据",
+            "latest": None,
+            "latest_date": None,
+            "stale": True,
+            "ma250": None,
+            "lower_bound": None,
+            "upper_bound": None,
+            "observations": 0,
+        }
+
+    trend = _trend_snapshot(series, slow_days, hysteresis_band, None)
+    latest_date = pd.Timestamp(series.index[-1]).normalize()
     return {
-        "available": True,
-        "reason": "有效",
-        "observations": int(len(observed)),
-        "latest": latest,
-        "latest_date": pd.Timestamp(observed.index[-1]).strftime("%Y-%m-%d"),
-        "fast_ma": fast_ma,
-        "slow_ma": slow_ma,
-        "conditions": conditions,
-        "multiplier": (0.0, 0.50, 1.0)[conditions],
+        "asset": asset,
+        "name": _asset_label(asset),
+        "error": None,
+        "latest": float(series.iloc[-1]),
+        "latest_date": latest_date.date().isoformat(),
+        "stale": bool(latest_date < asof.normalize()),
+        "ma250": trend["ma250"],
+        "lower_bound": trend["lower_bound"],
+        "upper_bound": trend["upper_bound"],
+        "observations": trend["observations"],
     }
 
 
-def _market_snapshot(store: MarketStore, asset: str, asof: pd.Timestamp) -> dict[str, Any]:
-    try:
-        series = store.read_series(asset)
-        series = series.loc[series.index <= asof]
-        if series.empty:
-            raise ValueError("计算日之前没有有效数据")
-        trend = _trend_snapshot(series, 20, 250)
-        latest_date = pd.Timestamp(series.index[-1])
-        return {
-            "latest": float(series.iloc[-1]),
-            "latest_date": latest_date.strftime("%Y-%m-%d"),
-            "stale_days": max((asof - latest_date).days, 0),
-            "ma20": _as_float(trend["fast_ma"]),
-            "ma250": _as_float(trend["slow_ma"]),
-            "observations": int(len(series)),
-            "trend": trend,
-            "error": None,
-        }
-    except Exception as exc:
-        return {
-            "latest": None,
-            "latest_date": None,
-            "stale_days": None,
-            "ma20": None,
-            "ma250": None,
-            "observations": 0,
-            "trend": _trend_snapshot(pd.Series(dtype=float), 20, 250),
-            "error": str(exc),
-        }
+def build_market_overview(store: MarketStore, asof: Any) -> list[Dict[str, Any]]:
+    timestamp = pd.Timestamp(asof).normalize()
+    return [_market_snapshot(store, asset, timestamp) for asset in MARKET_ASSETS]
 
 
-def build_market_overview(store: MarketStore, asof: date | pd.Timestamp) -> list[dict[str, Any]]:
-    timestamp = pd.Timestamp(asof)
-    return [
-        {
-            "asset": asset,
-            "label": ASSET_META[asset]["label"],
-            "source": ASSET_META[asset]["source"],
-            **_market_snapshot(store, asset, timestamp),
-        }
-        for asset in MARKET_ASSETS
-    ]
+def _commission(trade_value: float, rate: float, minimum: float) -> float:
+    if trade_value <= 0:
+        return 0.0
+    return max(trade_value * rate, minimum)
 
 
 def calculate_plan(
     store: MarketStore,
-    holdings: dict[str, float],
-    asof: date | pd.Timestamp,
-) -> dict[str, Any]:
+    holdings: Mapping[str, Any],
+    asof: Any,
+) -> Dict[str, Any]:
     config = load_config()
     timestamp = pd.Timestamp(asof).normalize()
-    base_weights = {asset: float(value) for asset, value in config["base_weights"].items()}
-    weights = dict(base_weights)
-    details: dict[str, dict[str, Any]] = {}
-    process: list[str] = [
-        f"计算日：{timestamp.strftime('%Y-%m-%d')}（使用不晚于该日的最新本地数据）",
-        "先从基础配置 15%/15%/10%/40%/10%/5%/5% 开始。",
-    ]
+    slow_days = int(config["slow_ma_days"])
+    hysteresis_band = float(config["hysteresis_band"])
+    release_to_cash = float(config["released_to_cash_ratio"])
+    release_to_bond = 1.0 - release_to_cash
+    commission_rate = float(config["commission_rate"])
+    minimum_commission = float(config["minimum_commission"])
+    base_weights = {asset: float(config["base_weights"][asset]) for asset in ALL_ASSETS}
+
+    signal_date, execution_date = _signal_context(store, timestamp)
+    prices = _aligned_prices(store, signal_date)
+    final_snapshots, _ = _replay_hysteresis(
+        prices,
+        signal_date,
+        slow_days=slow_days,
+        hysteresis_band=hysteresis_band,
+    )
+
+    target_weights = dict(base_weights)
+    released_weight = 0.0
+    unavailable_weight = 0.0
+    process: list[Dict[str, Any]] = []
 
     for asset in RISK_ASSETS:
-        snapshot = _market_snapshot(store, asset, timestamp)
-        trend = snapshot["trend"]
         base = base_weights[asset]
+        trend = final_snapshots[asset]
         if not trend["available"]:
-            weights[asset] = 0.0
-            weights["long_bond"] += base
+            target_weights[asset] = 0.0
+            target_weights["long_bond"] += base
+            unavailable_weight += base
             process.append(
-                f"{ASSET_META[asset]['label']}：有效历史不足250日，基础权重 {base:.1%} 暂转境内长期国债。"
+                {
+                    "asset": asset,
+                    "name": _asset_label(asset),
+                    "base_weight": base,
+                    "multiplier": 0.0,
+                    "released_weight": base,
+                    "destination": "历史不足250个交易日，基础权重全部转入境内长期国债",
+                    "action": "insufficient_history",
+                }
             )
-            details[asset] = {
-                "base_weight": base,
-                "target_weight": 0.0,
-                "released": base,
-                "release_to_cash": 0.0,
-                "release_to_bond": base,
-                "market": snapshot,
-            }
             continue
 
-        score = int(trend["conditions"])
         multiplier = float(trend["multiplier"])
         target = base * multiplier
         released = base - target
-        to_cash = released * float(config["released_to_cash_ratio"])
-        to_bond = released - to_cash
-        weights[asset] = target
-        weights["cash"] += to_cash
-        weights["long_bond"] += to_bond
-        condition_text = f"价格>{trend['slow_ma']:.4g}" if trend["latest"] > trend["slow_ma"] else f"价格<={trend['slow_ma']:.4g}"
-        ma_text = f"MA20>{trend['slow_ma']:.4g}" if trend["fast_ma"] > trend["slow_ma"] else f"MA20<={trend['slow_ma']:.4g}"
+        target_weights[asset] = target
+        target_weights["long_bond"] += released * release_to_bond
+        target_weights["cash"] += released * release_to_cash
+        released_weight += released
         process.append(
-            f"{ASSET_META[asset]['label']}：得分 {score}/2（{condition_text}，{ma_text}），"
-            f"系数 {multiplier:.0%}，目标 {target:.1%}；释放 {released:.1%}，现金/长期国债各分 {to_cash:.1%}/{to_bond:.1%}。"
-        )
-        details[asset] = {
-            "base_weight": base,
-            "target_weight": target,
-            "released": released,
-            "release_to_cash": to_cash,
-            "release_to_bond": to_bond,
-            "market": snapshot,
-        }
-
-    total_weight = sum(weights.values())
-    if total_weight <= 0:
-        raise ValueError("目标权重总和为零")
-    weights = {asset: value / total_weight for asset, value in weights.items()}
-    process.append("最后把目标权重归一化到100%；ETF 溢价/折价不作为信号。")
-
-    clean_holdings = {asset: max(float(holdings.get(asset, 0.0)), 0.0) for asset in ALL_ASSETS}
-    current_total = sum(clean_holdings.values())
-    if current_total <= 0:
-        raise ValueError("当前持仓和现金合计必须大于0")
-
-    rows: list[dict[str, Any]] = []
-    for asset in ALL_ASSETS:
-        current_value = clean_holdings[asset]
-        target_weight = float(weights.get(asset, 0.0))
-        target_value = current_total * target_weight
-        delta_value = target_value - current_value
-        action = "增加" if delta_value > 0.01 else "减少" if delta_value < -0.01 else "保持"
-        market = (
-            {}
-            if asset == "cash"
-            else details.get(asset, {}).get("market") or _market_snapshot(store, asset, timestamp)
-        )
-        if asset in {"long_bond", "cash"} and asset not in details:
-            details[asset] = {"base_weight": base_weights[asset], "target_weight": target_weight, "market": market}
-        rows.append(
             {
                 "asset": asset,
-                "label": ASSET_META[asset]["label"],
-                "source": ASSET_META[asset]["source"],
-                "base_weight": base_weights[asset],
-                "target_weight": target_weight,
-                "current_value": current_value,
-                "current_weight": current_value / current_total,
-                "target_value": target_value,
-                "delta_value": delta_value,
-                "action": action,
-                "latest": market.get("latest"),
-                "latest_date": market.get("latest_date"),
-                "ma20": market.get("ma20"),
-                "ma250": market.get("ma250"),
-                "observations": market.get("observations", 0),
-                "trend": details.get(asset, {}).get("market", {}).get("trend", {}),
-                "error": market.get("error"),
+                "name": _asset_label(asset),
+                "base_weight": base,
+                "multiplier": multiplier,
+                "released_weight": released,
+                "destination": "释放部分各50%转入境内长期国债和人民币现金",
+                "action": trend["action"],
             }
         )
 
-    process.append(
-        f"当前总资产 {current_total:,.2f} 元；目标金额按当前总资产计算，现金输入应包含本次准备投入的工资。"
-    )
+    total_weight = sum(target_weights.values())
+    if total_weight <= 0:
+        raise RuntimeError("目标权重计算失败。")
+    target_weights = {asset: weight / total_weight for asset, weight in target_weights.items()}
+
+    normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
+    current_total = sum(normalized_holdings.values())
+    rows: list[Dict[str, Any]] = []
+    total_commission = 0.0
+    action_labels = {
+        "switch_on": "高于上轨，持有",
+        "switch_off": "低于下轨，空仓",
+        "hold_previous": "滞回区间内，维持上月状态",
+        "initialize_from_ma250": "首次进入滞回区间，按MA250初始化",
+        "insufficient_history": "历史不足250日",
+    }
+
+    for asset in ALL_ASSETS:
+        target_weight = target_weights[asset]
+        target_value = current_total * target_weight
+        current_value = normalized_holdings[asset]
+        trade_value = target_value - current_value
+        fee = _commission(abs(trade_value), commission_rate, minimum_commission) if asset in ETF_ASSETS else 0.0
+        total_commission += fee
+
+        if asset in RISK_ASSETS:
+            trend = final_snapshots[asset]
+            market = {
+                "latest": trend["latest"],
+                "ma250": trend["ma250"],
+                "lower_bound": trend["lower_bound"],
+                "upper_bound": trend["upper_bound"],
+                "observations": trend["observations"],
+                "available": trend["available"],
+                "multiplier": trend["multiplier"],
+                "action": trend["action"],
+            }
+            signal_text = action_labels[trend["action"]]
+        elif asset == "long_bond":
+            market = _market_snapshot(store, asset, signal_date)
+            market.update({"available": True, "multiplier": None, "action": "defensive_asset"})
+            signal_text = "基础仓位 + 风险资产转入"
+        else:
+            market = {
+                "latest": 1.0,
+                "ma250": None,
+                "lower_bound": None,
+                "upper_bound": None,
+                "observations": None,
+                "available": True,
+                "multiplier": None,
+                "action": "cash_reserve",
+            }
+            signal_text = "基础仓位 + 风险资产转入"
+
+        rows.append(
+            {
+                "asset": asset,
+                "name": _asset_label(asset),
+                "current_value": current_value,
+                "current_weight": current_value / current_total if current_total > 0 else 0.0,
+                "target_weight": target_weight,
+                "target_value": target_value,
+                "trade_value": trade_value,
+                "trade_action": "增加" if trade_value > 0.01 else "减少" if trade_value < -0.01 else "不变",
+                "commission": fee,
+                "signal_text": signal_text,
+                "market": market,
+            }
+        )
+
     return {
-        "calculation_date": timestamp.strftime("%Y-%m-%d"),
+        "calculation_date": timestamp.date().isoformat(),
+        "signal_date": signal_date.date().isoformat(),
+        "execution_date": execution_date.date().isoformat() if execution_date is not None else None,
         "current_total": current_total,
-        "target_total": current_total,
-        "non_cash_increase": sum(max(row["delta_value"], 0.0) for row in rows if row["asset"] != "cash"),
-        "non_cash_decrease": sum(max(-row["delta_value"], 0.0) for row in rows if row["asset"] != "cash"),
-        "cash_change": next(row["delta_value"] for row in rows if row["asset"] == "cash"),
+        "target_weights": target_weights,
         "rows": rows,
         "process": process,
+        "released_weight": released_weight,
+        "unavailable_weight": unavailable_weight,
+        "estimated_commission": total_commission,
         "strategy": {
+            "slow_ma_days": slow_days,
+            "hysteresis_band": hysteresis_band,
+            "released_to_cash_ratio": release_to_cash,
+            "released_to_bond_ratio": release_to_bond,
+            "commission_rate": commission_rate,
+            "minimum_commission": minimum_commission,
             "base_weights": base_weights,
-            "fast_ma_days": 20,
-            "slow_ma_days": 250,
-            "risk_multipliers": {"0 conditions": 0.0, "1 condition": 0.5, "2 conditions": 1.0},
-            "released_to_cash_ratio": float(config["released_to_cash_ratio"]),
-            "fallback": "有效历史不足250个交易日的风险资产转入境内长期国债",
         },
     }
