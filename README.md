@@ -26,24 +26,24 @@ python -m app.main
 
 ## Docker / NAS
 
-本地构建运行：
+默认 `docker-compose.yml` 直接使用已经发布到 GHCR 的 v1 镜像：
 
 ```powershell
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-默认端口是 `8000`，持久化目录是项目下的 `data/`。NAS 上建议把 `./data` 映射到 NAS 的固定目录，并只在局域网或反向代理认证后访问；这个轻量版本没有用户登录系统。
+不需要 `.env` 文件，默认端口是 `8000`，持久化目录是项目下的 `data/`。如需修改端口或时区，可复制 `.env.example` 为 `.env` 后编辑。
 
-如果直接使用 GHCR 镜像：
+NAS 上建议把 `./data` 映射到 NAS 的固定目录，并只在局域网或反向代理认证后访问；这个轻量版本没有用户登录系统。
+
+如果需要从源码本地构建：
 
 ```powershell
-Copy-Item .env.example .env
-# 编辑 .env，把 IMAGE_NAME 改成实际镜像地址
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
-NAS 只需要 `docker-compose.ghcr.yml`、`.env` 和同目录的 `data/` 文件夹；也可以直接克隆整个 GitHub 仓库后运行上面两条命令。
+`docker-compose.ghcr.yml` 保留为兼容旧部署的同版本 GHCR 配置；新部署直接使用默认的 `docker-compose.yml` 即可。
 
 ## GitHub Actions / GHCR
 
