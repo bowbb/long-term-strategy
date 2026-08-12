@@ -37,7 +37,6 @@ ASSET_FILES = {
     "nasdaq100": "nasdaq100.csv",
     "gold": "gold.csv",
     "long_bond": "long_bond.csv",
-    "cash": "cash.csv",
 }
 
 ASSET_META = {
@@ -67,7 +66,7 @@ ASSET_META = {
     },
     "cash": {
         "label": "人民币现金",
-        "source": "本地现金收益代理，不作为风险资产均线信号",
+        "source": "手动输入的人民币现金金额，不使用行情序列",
     },
 }
 
@@ -109,6 +108,10 @@ class MarketStore:
     def ensure_store(self) -> None:
         self.price_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Cash is a manual input now; remove the old generated cash price proxy.
+        legacy_cash_path = self.price_dir / "cash.csv"
+        if legacy_cash_path.exists():
+            legacy_cash_path.unlink()
         for asset, filename in ASSET_FILES.items():
             target = self.price_dir / filename
             seed = SEED_DIR / filename

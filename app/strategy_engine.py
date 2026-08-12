@@ -13,7 +13,8 @@ from .market_data import ASSET_META, MarketStore
 APP_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = APP_ROOT / "app" / "strategy_config.json"
 RISK_ASSETS = ("csi300", "dividend_low_vol", "star50", "nasdaq100", "gold")
-ALL_ASSETS = RISK_ASSETS + ("long_bond", "cash")
+MARKET_ASSETS = RISK_ASSETS + ("long_bond",)
+ALL_ASSETS = MARKET_ASSETS + ("cash",)
 
 
 def load_config() -> dict[str, Any]:
@@ -99,7 +100,7 @@ def build_market_overview(store: MarketStore, asof: date | pd.Timestamp) -> list
             "source": ASSET_META[asset]["source"],
             **_market_snapshot(store, asset, timestamp),
         }
-        for asset in ALL_ASSETS
+        for asset in MARKET_ASSETS
     ]
 
 
@@ -180,7 +181,11 @@ def calculate_plan(
         target_value = current_total * target_weight
         delta_value = target_value - current_value
         action = "增加" if delta_value > 0.01 else "减少" if delta_value < -0.01 else "保持"
-        market = details.get(asset, {}).get("market") or _market_snapshot(store, asset, timestamp)
+        market = (
+            {}
+            if asset == "cash"
+            else details.get(asset, {}).get("market") or _market_snapshot(store, asset, timestamp)
+        )
         if asset in {"long_bond", "cash"} and asset not in details:
             details[asset] = {"base_weight": base_weights[asset], "target_weight": target_weight, "market": market}
         rows.append(
