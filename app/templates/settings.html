@@ -20,7 +20,7 @@
       </div>
     </form>
     <form method="post" action="{{ url_for('refresh') }}" class="manual-refresh-form">
-      <button class="button button-secondary" type="submit">立即刷新全部数据</button>
+      <button class="button button-secondary" type="submit">立即刷新远程数据</button>
     </form>
   </section>
 
@@ -28,7 +28,7 @@
     <div class="panel-head"><h2>刷新状态</h2></div>
     {% if logs %}
       <div class="refresh-summary">
-        <span>最近一次：{{ logs[0].finished_at }}</span>
+        <span>最近一次（UTC+8）：{{ logs[0].finished_at|datetime_cn }}</span>
         <span class="status status-{{ logs[0].status }}">{{ logs[0].status|status_text }}</span>
       </div>
       <div class="table-scroll">
@@ -56,11 +56,11 @@
   <div class="panel-head"><h2>历史刷新记录</h2></div>
   <div class="table-scroll">
     <table class="data-table compact-table">
-      <thead><tr><th>完成时间</th><th>总体状态</th><th>成功</th><th>警告</th><th>失败</th></tr></thead>
+      <thead><tr><th>完成时间（UTC+8）</th><th>总体状态</th><th>成功</th><th>警告</th><th>失败</th></tr></thead>
       <tbody>
       {% for item in logs %}
         <tr>
-          <td>{{ item.finished_at }}</td>
+          <td>{{ item.finished_at|datetime_cn }}</td>
           <td><span class="status status-{{ item.status }}">{{ item.status|status_text }}</span></td>
           <td>{{ item.success_count }}</td><td>{{ item.warning_count }}</td><td>{{ item.error_count }}</td>
         </tr>

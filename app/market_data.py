@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -17,8 +19,13 @@ DEFAULT_DATA_DIR = APP_ROOT / "data"
 SEED_DIR = APP_ROOT / "seed" / "prices"
 
 EASTMONEY_HISTORY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketDataService.getKLineData"
 YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+CN_TIMEZONE = "Asia/Shanghai"
+REFRESH_RETRY_DELAY_SECONDS = 60.0
+MAX_REFRESH_RETRIES = 5
 
 ASSET_FILES = {
     "csi300": "csi300.csv",
@@ -33,15 +40,15 @@ ASSET_FILES = {
 ASSET_META = {
     "csi300": {
         "label": "沪深300",
-        "source": "东方财富 510300 复权日线；历史种子为沪深300长期代理",
+        "source": "腾讯前复权 510300；Yahoo/新浪/东方财富备用，历史种子为沪深300长期代理",
     },
     "dividend_low_vol": {
         "label": "红利低波",
-        "source": "东方财富 512890 复权日线；历史种子为红利低波指数序列",
+        "source": "腾讯前复权 512890；Yahoo/新浪/东方财富备用，历史种子为红利低波指数序列",
     },
     "star50": {
         "label": "科创50",
-        "source": "东方财富 588000 复权日线；正式历史不足时不补造代理",
+        "source": "腾讯前复权 588000；Yahoo/新浪/东方财富备用，正式历史不足时不补造代理",
     },
     "nasdaq100": {
         "label": "纳斯达克100",
@@ -53,7 +60,7 @@ ASSET_META = {
     },
     "long_bond": {
         "label": "境内长期国债",
-        "source": "东方财富 511260 场内复权日线；历史不足时合并本地长期债券代理",
+        "source": "腾讯前复权 511260；Yahoo/新浪/东方财富备用，历史不足时合并本地长期债券代理",
     },
     "cash": {
         "label": "人民币现金",
@@ -77,6 +84,13 @@ def _clean_series(values: pd.Series) -> pd.Series:
     series.index = pd.to_datetime(series.index, errors="coerce").normalize()
     series = series[~series.index.isna()]
     return series[~series.index.duplicated(keep="last")].sort_index()
+
+
+def _completed_daily_series(series: pd.Series) -> pd.Series:
+    """Keep the latest completed local trading day, never today's unfinished bar."""
+    today_in_cn = pd.Timestamp.now(tz=CN_TIMEZONE).normalize().tz_localize(None)
+    cutoff = today_in_cn - pd.Timedelta(days=1)
+    return _clean_series(series[series.index <= cutoff])
 
 
 class MarketStore:
@@ -149,6 +163,18 @@ class MarketStore:
         elif incoming.empty:
             merged = existing
         else:
+            # ETF feeds and archived index proxies can use different price scales.
+            # Align the incoming level to the recent overlap, then append only new dates.
+            overlap = existing.index.intersection(incoming.index)
+            if len(overlap) > 0:
+                reference = overlap[-min(20, len(overlap)) :]
+                ratios = (existing.loc[reference] / incoming.loc[reference]).replace(
+                    [float("inf"), float("-inf")], pd.NA
+                ).dropna()
+                ratios = ratios[ratios > 0]
+                if not ratios.empty:
+                    incoming = incoming * float(ratios.median())
+            incoming = incoming[incoming.index > existing.index[-1]]
             merged = pd.concat([existing, incoming])
         merged = merged[~merged.index.duplicated(keep="last")].sort_index()
         self.write_series(name, merged)
@@ -174,7 +200,28 @@ class MarketStore:
             value = json.loads(self.refresh_log_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return []
-        return value if isinstance(value, list) else []
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, object]] = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                continue
+            # Cash is a local input series and has never been a remote refresh task.
+            raw_items = entry.get("items", [])
+            if not isinstance(raw_items, list):
+                raw_items = []
+            items = [
+                item
+                for item in raw_items
+                if isinstance(item, dict) and item.get("name") != "cash"
+            ]
+            entry = dict(entry)
+            entry["items"] = items
+            entry["success_count"] = sum(item.get("status") == "success" for item in items)
+            entry["warning_count"] = sum(item.get("status") == "warning" for item in items)
+            entry["error_count"] = sum(item.get("status") == "error" for item in items)
+            normalized.append(entry)
+        return normalized
 
     def append_refresh_log(self, entry: dict[str, object]) -> None:
         entries = self.load_refresh_log()
@@ -206,18 +253,18 @@ def _market_id(code: str) -> int:
     return 1 if code.startswith(("5", "6")) else 0
 
 
-def _request_json(session: requests.Session, url: str, params: dict[str, object]) -> dict:
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            response = session.get(url, params=params, timeout=20)
-            response.raise_for_status()
-            return response.json()
-        except Exception as exc:  # network providers fail in several ways
-            last_error = exc
-            if attempt == 0:
-                time.sleep(1.0)
-    raise RuntimeError(f"remote endpoint failed: {last_error}")
+def _request_json(
+    session: requests.Session,
+    url: str,
+    params: dict[str, object],
+    headers: dict[str, str] | None = None,
+) -> dict:
+    try:
+        response = session.get(url, params=params, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:  # network providers fail in several ways
+        raise RuntimeError(f"remote endpoint failed: {exc}") from exc
 
 
 def fetch_eastmoney_daily(session: requests.Session, code: str) -> pd.Series:
@@ -252,6 +299,115 @@ def fetch_eastmoney_daily(session: requests.Session, code: str) -> pd.Series:
     if not closes:
         raise RuntimeError(f"Eastmoney returned no valid closes for {code}")
     return _clean_series(pd.Series(closes, index=dates))
+
+
+def _cn_market_prefix(code: str) -> str:
+    return "sh" if code.startswith(("5", "6", "9")) else "sz"
+
+
+def _parse_daily_rows(rows: list[object], code: str, source: str) -> pd.Series:
+    dates: list[pd.Timestamp] = []
+    closes: list[float] = []
+    for raw_row in rows:
+        if isinstance(raw_row, dict):
+            date_value = raw_row.get("date") or raw_row.get("day")
+            close_value = raw_row.get("close")
+        else:
+            row = list(raw_row) if isinstance(raw_row, (list, tuple)) else str(raw_row).split(",")
+            if len(row) < 3:
+                continue
+            date_value = row[0]
+            close_value = row[2]
+        date = pd.to_datetime(date_value, errors="coerce")
+        close = pd.to_numeric(close_value, errors="coerce")
+        if pd.notna(date) and pd.notna(close) and float(close) > 0:
+            dates.append(pd.Timestamp(date).normalize())
+            closes.append(float(close))
+    series = _clean_series(pd.Series(closes, index=dates))
+    if series.empty:
+        raise RuntimeError(f"{source} returned no valid daily data for {code}")
+    return series
+
+
+def fetch_tencent_adjusted_close(session: requests.Session, code: str) -> pd.Series:
+    symbol = f"{_cn_market_prefix(code)}{code}"
+    payload = _request_json(
+        session,
+        TENCENT_KLINE_URL,
+        {"param": f"{symbol},day,,,10000,qfq"},
+        headers={"Referer": "https://gu.qq.com/"},
+    )
+    quote = ((payload.get("data") or {}).get(symbol)) or {}
+    rows = quote.get("qfqday") or quote.get("day") or []
+    return _parse_daily_rows(rows, code, "腾讯财经")
+
+
+def _decode_json_or_jsonp(response: requests.Response) -> object:
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError:
+        match = re.search(r"(\[.*\]|\{.*\})", response.text, flags=re.DOTALL)
+        if not match:
+            raise RuntimeError("response is neither JSON nor JSONP")
+        return json.loads(match.group(1))
+
+
+def fetch_sina_daily(session: requests.Session, code: str) -> pd.Series:
+    payload = _decode_json_or_jsonp(
+        session.get(
+            SINA_KLINE_URL,
+            params={
+                "symbol": f"{_cn_market_prefix(code)}{code}",
+                "scale": "240",
+                "ma": "no",
+                "datalen": "10000",
+            },
+            headers={"Referer": "https://finance.sina.com.cn/"},
+            timeout=20,
+        )
+    )
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("klines") or []
+    else:
+        rows = payload
+    if not isinstance(rows, list):
+        raise RuntimeError(f"新浪财经 returned an unexpected payload for {code}")
+    return _parse_daily_rows(rows, code, "新浪财经")
+
+
+def fetch_domestic_daily(
+    session: requests.Session, code: str
+) -> tuple[pd.Series, str]:
+    providers: list[tuple[str, Callable[[], pd.Series]]] = [
+        (
+            "腾讯财经前复权",
+            lambda: fetch_tencent_adjusted_close(session, code),
+        ),
+        (
+            "Yahoo Finance ETF 复权价",
+            lambda: fetch_yahoo_adjusted_close(session, f"{code}.SS"),
+        ),
+        (
+            "新浪财经日线",
+            lambda: fetch_sina_daily(session, code),
+        ),
+        (
+            "东方财富复权日线",
+            lambda: fetch_eastmoney_daily(session, code),
+        ),
+    ]
+    failures: list[str] = []
+    for provider, fetch in providers:
+        try:
+            series = fetch()
+            series = _completed_daily_series(series)
+            if not series.empty:
+                return series, provider
+        except Exception as exc:
+            failures.append(f"{provider}: {exc}")
+    detail = "；".join(failures)
+    raise RuntimeError(f"所有境内行情源均失败（{code}）：{detail}")
 
 
 def fetch_yahoo_adjusted_close(
@@ -334,12 +490,24 @@ def _update_remote_series(
     name: str,
     label: str,
     source: str,
-    fetch: Callable[[], pd.Series],
+    fetch: Callable[[], pd.Series | tuple[pd.Series, str]],
 ) -> dict[str, object]:
     try:
-        incoming = fetch()
+        fetched = fetch()
+        provider = source
+        if isinstance(fetched, tuple):
+            incoming, provider = fetched
+        else:
+            incoming = fetched
         merged = store.merge_and_write(name, incoming)
-        return _status(name, "success", source, "远程数据已合并到本地", merged, label=label)
+        return _status(
+            name,
+            "success",
+            provider,
+            f"{provider} 数据已合并到本地",
+            merged,
+            label=label,
+        )
     except Exception as exc:
         try:
             cached = store.read_series(name)
@@ -354,6 +522,33 @@ def _update_remote_series(
             )
         except Exception:
             return _status(name, "error", source, str(exc), label=label)
+
+
+def _refresh_remote_tasks(
+    store: MarketStore,
+    session: requests.Session,
+    tasks: list[tuple[str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]]]],
+) -> list[dict[str, object]]:
+    """Run remote tasks serially, retrying only failed tasks between rounds."""
+    statuses: dict[str, dict[str, object]] = {}
+    for name, label, source, fetch in tasks:
+        statuses[name] = _update_remote_series(store, session, name, label, source, fetch)
+
+    for retry_number in range(1, MAX_REFRESH_RETRIES + 1):
+        failed_tasks = [task for task in tasks if statuses[task[0]]["status"] != "success"]
+        if not failed_tasks:
+            break
+        time.sleep(REFRESH_RETRY_DELAY_SECONDS)
+        for name, label, source, fetch in failed_tasks:
+            retry_status = _update_remote_series(store, session, name, label, source, fetch)
+            if retry_status["status"] != "success":
+                retry_status = dict(retry_status)
+                retry_status["message"] = (
+                    f"{retry_status['message']}；已完成第 {retry_number}/{MAX_REFRESH_RETRIES} 次重试"
+                )
+            statuses[name] = retry_status
+
+    return [statuses[name] for name, _, _, _ in tasks]
 
 
 def _combine_cny_series(
@@ -390,7 +585,15 @@ def _combine_cny_series(
             return _status(name, "error", ASSET_META[name]["source"], str(exc))
 
 
+_REFRESH_LOCK = threading.Lock()
+
+
 def refresh_all(data_dir: Path | None = None) -> dict[str, object]:
+    with _REFRESH_LOCK:
+        return _refresh_all(data_dir)
+
+
+def _refresh_all(data_dir: Path | None = None) -> dict[str, object]:
     store = MarketStore(data_dir)
     store.ensure_store()
     started = _utc_now()
@@ -403,6 +606,7 @@ def refresh_all(data_dir: Path | None = None) -> dict[str, object]:
     )
     statuses: list[dict[str, object]] = []
 
+    tasks: list[tuple[str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]]]] = []
     domestic = [
         ("csi300", "510300"),
         ("dividend_low_vol", "512890"),
@@ -410,58 +614,44 @@ def refresh_all(data_dir: Path | None = None) -> dict[str, object]:
         ("long_bond", "511260"),
     ]
     for asset, code in domestic:
-        statuses.append(
-            _update_remote_series(
-                store,
-                session,
+        tasks.append(
+            (
                 asset,
                 ASSET_META[asset]["label"],
                 ASSET_META[asset]["source"],
-                lambda code=code: fetch_eastmoney_daily(session, code),
+                lambda code=code: fetch_domestic_daily(session, code),
             )
         )
 
-    fx_status = _update_remote_series(
-        store,
-        session,
-        "usd_cny",
-        "USD/CNY",
-        "FRED DEXCHUS",
-        lambda: fetch_fred_series(session, "DEXCHUS"),
+    tasks.extend(
+        [
+            (
+                "usd_cny",
+                "USD/CNY",
+                "FRED DEXCHUS",
+                lambda: fetch_fred_series(session, "DEXCHUS"),
+            ),
+            (
+                "qqq_usd",
+                "QQQ美元价格",
+                "Yahoo Finance QQQ",
+                lambda: fetch_yahoo_adjusted_close(session, "QQQ"),
+            ),
+            (
+                "gld_usd",
+                "GLD美元价格",
+                "Yahoo Finance GLD",
+                lambda: fetch_yahoo_adjusted_close(session, "GLD"),
+            ),
+        ]
     )
-    qqq_status = _update_remote_series(
-        store,
-        session,
-        "qqq_usd",
-        "QQQ美元价格",
-        "Yahoo Finance QQQ",
-        lambda: fetch_yahoo_adjusted_close(session, "QQQ"),
-    )
-    gld_status = _update_remote_series(
-        store,
-        session,
-        "gld_usd",
-        "GLD美元价格",
-        "Yahoo Finance GLD",
-        lambda: fetch_yahoo_adjusted_close(session, "GLD"),
-    )
-    statuses.extend([fx_status, qqq_status, gld_status])
+    statuses.extend(_refresh_remote_tasks(store, session, tasks))
+    status_by_name = {item["name"]: item for item in statuses}
+    fx_status = status_by_name["usd_cny"]
+    qqq_status = status_by_name["qqq_usd"]
+    gld_status = status_by_name["gld_usd"]
     statuses.append(_combine_cny_series(store, "nasdaq100", "qqq_usd", [fx_status, qqq_status]))
     statuses.append(_combine_cny_series(store, "gold", "gld_usd", [fx_status, gld_status]))
-
-    try:
-        cash = store.read_series("cash")
-        statuses.append(
-            _status(
-                "cash",
-                "success",
-                ASSET_META["cash"]["source"],
-                "现金收益代理保留本地序列",
-                cash,
-            )
-        )
-    except Exception as exc:
-        statuses.append(_status("cash", "error", ASSET_META["cash"]["source"], str(exc)))
 
     errors = [item for item in statuses if item["status"] == "error"]
     warnings = [item for item in statuses if item["status"] == "warning"]

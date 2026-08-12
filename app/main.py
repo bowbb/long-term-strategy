@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, flash, redirect, render_template, request, url_for
@@ -16,6 +16,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "local-strategy-app")
 store = MarketStore()
 store.ensure_store()
 _scheduler_wakeup = threading.Event()
+_CN_ZONE = ZoneInfo("Asia/Shanghai")
 
 
 @app.template_filter("money")
@@ -52,6 +53,19 @@ def status_text(value):
     return {"success": "成功", "warning": "警告", "error": "失败", "partial": "部分成功", "failed": "失败"}.get(
         str(value), str(value)
     )
+
+
+@app.template_filter("datetime_cn")
+def datetime_cn(value):
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_CN_ZONE)
+        return parsed.astimezone(_CN_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _timezone(name: str) -> ZoneInfo:
@@ -110,7 +124,7 @@ def _parse_holdings(form) -> dict[str, float]:
 
 
 def _record_refresh_exception(exc: Exception) -> None:
-    now = datetime.now().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     store.append_refresh_log(
         {
             "started_at": now,
