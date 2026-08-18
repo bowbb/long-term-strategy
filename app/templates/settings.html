@@ -5,7 +5,7 @@
   <div>
     <div class="eyebrow">LOCAL DATA STORE</div>
     <h1>设置与刷新</h1>
-    <p class="muted">数据写入 Docker 挂载的本地 data 目录，刷新失败时保留上一份可用数据。</p>
+    <p class="muted">数据写入 Docker 挂载的本地 data 目录；刷新失败时保留上一份已通过官方质量检查的数据。</p>
   </div>
 </section>
 
@@ -47,9 +47,30 @@
         </table>
       </div>
     {% else %}
-      <p class="muted">还没有刷新记录。种子数据可以直接用于计算，首次手动刷新后会在这里显示各项状态。</p>
+      <p class="muted">还没有刷新记录。请先执行一次官方数据刷新。</p>
     {% endif %}
   </section>
+</section>
+
+<section class="panel history-panel">
+  <div class="panel-head"><h2>官方数据来源</h2></div>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>资产</th><th>交易标的</th><th>来源</th><th>核验</th></tr></thead>
+      <tbody>
+      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond'] %}
+        {% set meta = asset_meta[asset] %}
+        <tr>
+          <td>{{ meta.label }}</td>
+          <td>{{ meta.instrument }}</td>
+          <td>{{ meta.source }}</td>
+          <td>{% if meta.source_url %}<a href="{{ meta.source_url }}" target="_blank" rel="noreferrer">打开官方链接</a>{% else %}-{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">纳斯达克100和黄金的人民币换算共用 USD/CNY：<a href="https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXCHUS" target="_blank" rel="noreferrer">FRED DEXCHUS</a>；FRED 不可用时回退 <a href="https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip" target="_blank" rel="noreferrer">ECB 官方历史参考汇率</a>。</p>
 </section>
 
 <section class="panel history-panel">

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
-import re
+import shutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -17,18 +18,19 @@ import requests
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = APP_ROOT / "data"
-SEED_DIR = APP_ROOT / "seed" / "prices"
 
-EASTMONEY_HISTORY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketDataService.getKLineData"
-YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-FRANKFURTER_TIMESERIES_URL = "https://api.frankfurter.dev/v1/{start}.."
 ECB_HISTORICAL_ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
+SSE_DAYK_URL = "http://yunhq.sse.com.cn:32041/v1/sh1/dayk/{code}"
+CSINDEX_HISTORY_URL = "https://www.csindex.com.cn/csindex-home/perf/index-perf"
+NASDAQ_HISTORICAL_URL = "https://api.nasdaq.com/api/quote/{symbol}/historical"
+GLD_HISTORICAL_ARCHIVE_URL = (
+    "https://api.spdrgoldshares.com/api/v1/historical-archive?exchange=NYSE&lang=en&product=gld"
+)
 CN_TIMEZONE = "Asia/Shanghai"
 REFRESH_RETRY_DELAY_SECONDS = 60.0
 MAX_REFRESH_RETRIES = 5
+DATA_SCHEMA_VERSION = 3
 
 ASSET_FILES = {
     "dividend_low_vol": "dividend_low_vol.csv",
@@ -40,19 +42,27 @@ ASSET_FILES = {
 ASSET_META = {
     "dividend_low_vol": {
         "label": "红利低波",
-        "source": "腾讯前复权 512890；Yahoo/新浪/东方财富备用，历史种子为红利低波指数序列",
+        "source": "中证指数官方 H20269 红利低波全收益指数",
+        "source_url": f"{CSINDEX_HISTORY_URL}?indexCode=H20269&startDate=20050101",
+        "instrument": "H20269",
     },
     "nasdaq100": {
         "label": "纳斯达克100",
-        "source": "Yahoo Finance QQQ 复权价乘多源 USD/CNY，换算为人民币",
+        "source": "Nasdaq 官方 QQQ 日线收盘价乘美联储 H.10 USD/CNY",
+        "source_url": NASDAQ_HISTORICAL_URL.format(symbol="QQQ"),
+        "instrument": "QQQ",
     },
     "gold": {
         "label": "黄金",
-        "source": "Yahoo Finance GLD 复权价乘多源 USD/CNY，换算为人民币",
+        "source": "State Street 官方 GLD 历史收盘价乘美联储 H.10 USD/CNY",
+        "source_url": GLD_HISTORICAL_ARCHIVE_URL,
+        "instrument": "GLD",
     },
     "long_bond": {
         "label": "境内长期国债",
-        "source": "腾讯前复权 511260；Yahoo/新浪/东方财富备用，历史不足时合并本地长期债券代理",
+        "source": "上交所官方日线 511260（原始 ETF 收盘价）",
+        "source_url": SSE_DAYK_URL.format(code="511260"),
+        "instrument": "511260",
     },
     "cash": {
         "label": "人民币现金",
@@ -78,6 +88,36 @@ def _clean_series(values: pd.Series) -> pd.Series:
     return series[~series.index.duplicated(keep="last")].sort_index()
 
 
+def _validate_official_series(name: str, values: pd.Series) -> pd.Series:
+    series = _clean_series(values)
+    if series.empty:
+        raise RuntimeError(f"官方数据为空：{name}")
+    if (series <= 0).any():
+        raise RuntimeError(f"官方数据包含非正价格：{name}")
+    if len(series) > 1:
+        returns = series.pct_change().dropna()
+        if not returns.empty and float(returns.abs().max()) > 10.0:
+            raise RuntimeError(f"官方数据存在异常尺度跳变：{name}")
+    latest = pd.Timestamp(series.index[-1]).normalize()
+    today = pd.Timestamp.now(tz=CN_TIMEZONE).tz_localize(None).normalize()
+    if latest < today - pd.Timedelta(days=14):
+        raise RuntimeError(f"官方数据过旧：{name} 最后日期为 {latest.date()}")
+    return series
+
+
+def _series_digest(series: pd.Series | None) -> str | None:
+    if series is None:
+        return None
+    cleaned = _clean_series(series)
+    if cleaned.empty:
+        return None
+    payload = "\n".join(
+        f"{pd.Timestamp(date).strftime('%Y-%m-%d')},{float(value):.12g}"
+        for date, value in cleaned.items()
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _completed_daily_series(series: pd.Series) -> pd.Series:
     """Keep the latest completed local trading day, never today's unfinished bar."""
     today_in_cn = pd.Timestamp.now(tz=CN_TIMEZONE).normalize().tz_localize(None)
@@ -90,6 +130,8 @@ class MarketStore:
         configured = data_dir or Path(os.environ.get("DATA_DIR", DEFAULT_DATA_DIR))
         self.data_dir = configured
         self.price_dir = self.data_dir / "prices"
+        self.legacy_price_dir = self.data_dir / "legacy_prices"
+        self.schema_path = self.data_dir / "source_schema.json"
         self.settings_path = self.data_dir / "settings.json"
         self.refresh_log_path = self.data_dir / "refresh_log.json"
         self.input_path = self.data_dir / "portfolio_input.json"
@@ -98,15 +140,11 @@ class MarketStore:
     def ensure_store(self) -> None:
         self.price_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_official_store()
         active_files = set(ASSET_FILES.values()) | {"usd_cny.csv", "qqq_usd.csv", "gld_usd.csv"}
         for cached_path in self.price_dir.glob("*.csv"):
             if cached_path.name not in active_files:
                 cached_path.unlink()
-        for asset, filename in ASSET_FILES.items():
-            target = self.price_dir / filename
-            seed = SEED_DIR / filename
-            if not target.exists() and seed.exists():
-                target.write_bytes(seed.read_bytes())
         if not self.settings_path.exists():
             self.save_settings(
                 {
@@ -117,6 +155,40 @@ class MarketStore:
         if not self.refresh_log_path.exists():
             self._atomic_json(self.refresh_log_path, [])
         self._migrate_runtime_state()
+
+    def _prepare_official_store(self) -> None:
+        """Quarantine stale source data before changing the official data policy."""
+        try:
+            state = json.loads(self.schema_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if isinstance(state, dict) and int(state.get("version", 0)) >= DATA_SCHEMA_VERSION:
+            return
+
+        previous_version = int(state.get("version", 0)) if isinstance(state, dict) else 0
+        if previous_version < 2:
+            legacy_files = list(self.price_dir.glob("*.csv"))
+        else:
+            dividend_path = self.price_dir / ASSET_FILES["dividend_low_vol"]
+            legacy_files = [dividend_path] if dividend_path.exists() else []
+        if legacy_files:
+            target_dir = self.legacy_price_dir / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for path in legacy_files:
+                shutil.move(str(path), str(target_dir / path.name))
+        if self.calculation_path.exists():
+            state_dir = self.data_dir / "legacy_state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(self.calculation_path), str(state_dir / "last_calculation.json"))
+        self._atomic_json(
+            self.schema_path,
+            {
+                "version": DATA_SCHEMA_VERSION,
+                "source_policy": "official_only_csindex_h20269",
+                "requires_refresh": True,
+                "migrated_at": _utc_now(),
+            },
+        )
 
     def _atomic_json(self, path: Path, value: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +266,18 @@ class MarketStore:
         frame.to_csv(temp, index=False, date_format="%Y-%m-%d")
         os.replace(temp, path)
 
+    def replace_series(self, name: str, series: pd.Series) -> pd.Series:
+        """Replace the full local history with a validated official series."""
+        cleaned = _validate_official_series(name, series)
+        self.write_series(name, cleaned)
+        return cleaned
+
     def merge_and_write(self, name: str, incoming: pd.Series) -> pd.Series:
+        """Append compatible data without silently changing its price scale.
+
+        Official refreshes use :meth:`replace_series`; this method remains only
+        for callers that intentionally append a same-scale local series.
+        """
         try:
             existing = self.read_series(name)
         except (FileNotFoundError, ValueError):
@@ -205,8 +288,6 @@ class MarketStore:
         elif incoming.empty:
             merged = existing
         else:
-            # ETF feeds and archived index proxies can use different price scales.
-            # Align the incoming level to the recent overlap, then append only new dates.
             overlap = existing.index.intersection(incoming.index)
             if len(overlap) > 0:
                 reference = overlap[-min(20, len(overlap)) :]
@@ -215,7 +296,11 @@ class MarketStore:
                 ).dropna()
                 ratios = ratios[ratios > 0]
                 if not ratios.empty:
-                    incoming = incoming * float(ratios.median())
+                    scale = float(ratios.median())
+                    if scale < 0.8 or scale > 1.25:
+                        raise RuntimeError(
+                            f"拒绝拼接不同价格尺度的数据：{name} 中位比例 {scale:.6g}"
+                        )
             incoming = incoming[incoming.index > existing.index[-1]]
             merged = pd.concat([existing, incoming])
         merged = merged[~merged.index.duplicated(keep="last")].sort_index()
@@ -287,10 +372,6 @@ class MarketStore:
         return value if isinstance(value, dict) else None
 
 
-def _market_id(code: str) -> int:
-    return 1 if code.startswith(("5", "6")) else 0
-
-
 def _request_json(
     session: requests.Session,
     url: str,
@@ -305,175 +386,172 @@ def _request_json(
         raise RuntimeError(f"remote endpoint failed: {exc}") from exc
 
 
-def fetch_eastmoney_daily(session: requests.Session, code: str) -> pd.Series:
+def fetch_sse_daily(
+    session: requests.Session, code: str, start: str = "2005-01-01"
+) -> tuple[pd.Series, str]:
+    """Read official Shanghai Stock Exchange daily ETF closes."""
     payload = _request_json(
         session,
-        EASTMONEY_HISTORY_URL,
-        {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "klt": "101",
-            "fqt": "1",
-            "beg": "0",
-            "end": "20500101",
-            "secid": f"{_market_id(code)}.{code}",
-        },
+        SSE_DAYK_URL.format(code=code),
+        {"begin": "-10000", "end": "-1", "period": "day"},
+        headers={"Referer": "https://www.sse.com.cn/", "Accept": "application/json"},
     )
-    rows = ((payload.get("data") or {}).get("klines")) or []
-    if not rows:
-        raise RuntimeError(f"Eastmoney returned no daily data for {code}")
+    rows = payload.get("kline") or []
     dates: list[pd.Timestamp] = []
     closes: list[float] = []
-    for raw_row in rows:
-        row = str(raw_row).split(",")
-        if len(row) < 3:
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
             continue
-        date = pd.to_datetime(row[0], errors="coerce")
-        close = pd.to_numeric(row[2], errors="coerce")
+        date = pd.to_datetime(str(row[0]), format="%Y%m%d", errors="coerce")
+        close = pd.to_numeric(row[4], errors="coerce")
         if pd.notna(date) and pd.notna(close) and float(close) > 0:
             dates.append(pd.Timestamp(date).normalize())
             closes.append(float(close))
-    if not closes:
-        raise RuntimeError(f"Eastmoney returned no valid closes for {code}")
-    return _clean_series(pd.Series(closes, index=dates))
+    series = _completed_daily_series(pd.Series(closes, index=dates))
+    start_date = pd.Timestamp(start).normalize()
+    series = series.loc[series.index >= start_date]
+    return _validate_official_series(f"SSE {code}", series), f"SSE 官方日线 {code}"
 
 
-def _cn_market_prefix(code: str) -> str:
-    return "sh" if code.startswith(("5", "6", "9")) else "sz"
+def fetch_csindex_history(
+    session: requests.Session,
+    index_code: str,
+    start: str = "2005-01-01",
+) -> tuple[pd.Series, str]:
+    """Read an official CSI daily total-return index history."""
+    start_date = pd.Timestamp(start).normalize()
+    end_date = (
+        pd.Timestamp.now(tz=CN_TIMEZONE).date() + pd.Timedelta(days=1)
+    ).strftime("%Y%m%d")
+    try:
+        response = session.get(
+            CSINDEX_HISTORY_URL,
+            params={
+                "indexCode": index_code,
+                "startDate": start_date.strftime("%Y%m%d"),
+                "endDate": end_date,
+            },
+            headers={
+                "User-Agent": "long-term-strategy-local-app/1.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.csindex.com.cn/",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"CSIndex {index_code} endpoint failed: {exc}") from exc
 
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"CSIndex {index_code} response has no data list")
 
-def _parse_daily_rows(rows: list[object], code: str, source: str) -> pd.Series:
     dates: list[pd.Timestamp] = []
     closes: list[float] = []
-    for raw_row in rows:
-        if isinstance(raw_row, dict):
-            date_value = raw_row.get("date") or raw_row.get("day")
-            close_value = raw_row.get("close")
-        else:
-            row = list(raw_row) if isinstance(raw_row, (list, tuple)) else str(raw_row).split(",")
-            if len(row) < 3:
-                continue
-            date_value = row[0]
-            close_value = row[2]
-        date = pd.to_datetime(date_value, errors="coerce")
-        close = pd.to_numeric(close_value, errors="coerce")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date = pd.to_datetime(
+            str(row.get("tradeDate") or ""),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+        close = pd.to_numeric(row.get("close"), errors="coerce")
         if pd.notna(date) and pd.notna(close) and float(close) > 0:
             dates.append(pd.Timestamp(date).normalize())
             closes.append(float(close))
-    series = _clean_series(pd.Series(closes, index=dates))
-    if series.empty:
-        raise RuntimeError(f"{source} returned no valid daily data for {code}")
-    return series
+
+    series = _completed_daily_series(pd.Series(closes, index=dates, name=index_code))
+    series = series.loc[series.index >= start_date]
+    return _validate_official_series(
+        f"CSIndex {index_code}", series
+    ), f"中证指数官方 {index_code} 全收益指数"
 
 
-def fetch_tencent_adjusted_close(session: requests.Session, code: str) -> pd.Series:
-    symbol = f"{_cn_market_prefix(code)}{code}"
-    payload = _request_json(
-        session,
-        TENCENT_KLINE_URL,
-        {"param": f"{symbol},day,,,10000,qfq"},
-        headers={"Referer": "https://gu.qq.com/"},
+def fetch_nasdaq_historical(
+    session: requests.Session,
+    symbol: str,
+    asset_class: str,
+    start: str = "2005-01-01",
+) -> tuple[pd.Series, str]:
+    """Read official Nasdaq historical daily closes with pagination."""
+    start_date = pd.Timestamp(start).date().isoformat()
+    end_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    rows: list[dict[str, object]] = []
+    offset = 0
+    total: int | None = None
+    while total is None or offset < total:
+        payload = _request_json(
+            session,
+            NASDAQ_HISTORICAL_URL.format(symbol=symbol),
+            {
+                "assetclass": asset_class,
+                "fromdate": start_date,
+                "todate": end_date,
+                "limit": 5000,
+                "offset": offset,
+            },
+            headers={
+                "User-Agent": "long-term-strategy-local-app/1.0",
+                "Accept": "application/json",
+                "Origin": "https://www.nasdaq.com",
+                "Referer": f"https://www.nasdaq.com/market-activity/{asset_class}/{symbol.lower()}/historical",
+            },
+        )
+        data = payload.get("data") or {}
+        table = data.get("tradesTable") if isinstance(data, dict) else None
+        page = table.get("rows") if isinstance(table, dict) else None
+        if not isinstance(page, list) or not page:
+            break
+        rows.extend(item for item in page if isinstance(item, dict))
+        raw_total = data.get("totalRecords") if isinstance(data, dict) else None
+        try:
+            total = int(raw_total) if raw_total is not None else offset + len(page)
+        except (TypeError, ValueError):
+            total = offset + len(page)
+        offset += len(page)
+        if len(page) < 5000:
+            break
+
+    dates: list[pd.Timestamp] = []
+    closes: list[float] = []
+    for row in rows:
+        date = pd.to_datetime(row.get("date"), format="%m/%d/%Y", errors="coerce")
+        raw_close = str(row.get("close", "")).replace(",", "")
+        close = pd.to_numeric(raw_close, errors="coerce")
+        if pd.notna(date) and pd.notna(close) and float(close) > 0:
+            dates.append(pd.Timestamp(date).normalize())
+            closes.append(float(close))
+    series = _completed_daily_series(pd.Series(closes, index=dates))
+    return _validate_official_series(f"Nasdaq {symbol}", series), f"Nasdaq 官方 {symbol} 日线"
+
+
+def fetch_gld_historical(session: requests.Session, start: str = "2005-01-01") -> tuple[pd.Series, str]:
+    """Read State Street's official GLD historical archive workbook."""
+    response = session.get(
+        GLD_HISTORICAL_ARCHIVE_URL,
+        headers={"User-Agent": "long-term-strategy-local-app/1.0"},
+        timeout=60,
     )
-    quote = ((payload.get("data") or {}).get(symbol)) or {}
-    rows = quote.get("qfqday") or quote.get("day") or []
-    return _parse_daily_rows(rows, code, "腾讯财经")
-
-
-def _decode_json_or_jsonp(response: requests.Response) -> object:
     response.raise_for_status()
     try:
-        return response.json()
-    except ValueError:
-        match = re.search(r"(\[.*\]|\{.*\})", response.text, flags=re.DOTALL)
-        if not match:
-            raise RuntimeError("response is neither JSON nor JSONP")
-        return json.loads(match.group(1))
-
-
-def fetch_sina_daily(session: requests.Session, code: str) -> pd.Series:
-    payload = _decode_json_or_jsonp(
-        session.get(
-            SINA_KLINE_URL,
-            params={
-                "symbol": f"{_cn_market_prefix(code)}{code}",
-                "scale": "240",
-                "ma": "no",
-                "datalen": "10000",
-            },
-            headers={"Referer": "https://finance.sina.com.cn/"},
-            timeout=20,
-        )
-    )
-    if isinstance(payload, dict):
-        rows = payload.get("data") or payload.get("klines") or []
-    else:
-        rows = payload
-    if not isinstance(rows, list):
-        raise RuntimeError(f"新浪财经 returned an unexpected payload for {code}")
-    return _parse_daily_rows(rows, code, "新浪财经")
+        frame = pd.read_excel(BytesIO(response.content), sheet_name="US GLD Historical Archive")
+    except Exception as exc:
+        raise RuntimeError(f"GLD 官方历史归档无法读取：{exc}") from exc
+    if "Date" not in frame or "Closing Price" not in frame:
+        raise RuntimeError("GLD 官方历史归档缺少 Date/Closing Price 列")
+    dates = pd.to_datetime(frame["Date"], errors="coerce")
+    closes = pd.to_numeric(frame["Closing Price"], errors="coerce")
+    series = _completed_daily_series(pd.Series(closes.to_numpy(), index=dates))
+    series = series.loc[series.index >= pd.Timestamp(start).normalize()]
+    return _validate_official_series("GLD", series), "State Street 官方 GLD 历史归档"
 
 
 def fetch_domestic_daily(
     session: requests.Session, code: str
 ) -> tuple[pd.Series, str]:
-    providers: list[tuple[str, Callable[[], pd.Series]]] = [
-        (
-            "腾讯财经前复权",
-            lambda: fetch_tencent_adjusted_close(session, code),
-        ),
-        (
-            "Yahoo Finance ETF 复权价",
-            lambda: fetch_yahoo_adjusted_close(session, f"{code}.SS"),
-        ),
-        (
-            "新浪财经日线",
-            lambda: fetch_sina_daily(session, code),
-        ),
-        (
-            "东方财富复权日线",
-            lambda: fetch_eastmoney_daily(session, code),
-        ),
-    ]
-    failures: list[str] = []
-    for provider, fetch in providers:
-        try:
-            series = fetch()
-            series = _completed_daily_series(series)
-            if not series.empty:
-                return series, provider
-        except Exception as exc:
-            failures.append(f"{provider}: {exc}")
-    detail = "；".join(failures)
-    raise RuntimeError(f"所有境内行情源均失败（{code}）：{detail}")
-
-
-def fetch_yahoo_adjusted_close(
-    session: requests.Session, symbol: str, start: str = "2005-01-01"
-) -> pd.Series:
-    start_timestamp = int(pd.Timestamp(start, tz="UTC").timestamp())
-    end_timestamp = int((pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)).timestamp())
-    payload = _request_json(
-        session,
-        YAHOO_CHART_URL.format(symbol=symbol),
-        {
-            "period1": start_timestamp,
-            "period2": end_timestamp,
-            "interval": "1d",
-            "events": "history",
-        },
-    )
-    result = ((payload.get("chart") or {}).get("result") or [None])[0]
-    if not result or not result.get("timestamp"):
-        raise RuntimeError(f"Yahoo returned no daily data for {symbol}")
-    timestamps = pd.to_datetime(result["timestamp"], unit="s", utc=True).tz_localize(None).normalize()
-    indicators = result.get("indicators") or {}
-    adjusted = (indicators.get("adjclose") or [{}])[0].get("adjclose")
-    if adjusted is None:
-        adjusted = (indicators.get("quote") or [{}])[0].get("close")
-    if adjusted is None:
-        raise RuntimeError(f"Yahoo returned no close data for {symbol}")
-    return _clean_series(pd.Series(adjusted, index=timestamps))
+    return fetch_sse_daily(session, code)
 
 
 def fetch_fred_series(
@@ -498,31 +576,6 @@ def fetch_fred_series(
     series = _clean_series(series)
     if series.empty:
         raise RuntimeError(f"FRED returned no observations for {series_id}")
-    return series
-
-
-def fetch_frankfurter_usd_cny(
-    session: requests.Session, start: str = "2005-01-01"
-) -> pd.Series:
-    payload = _request_json(
-        session,
-        FRANKFURTER_TIMESERIES_URL.format(start=start),
-        {"base": "USD", "symbols": "CNY"},
-    )
-    rates = payload.get("rates")
-    if not isinstance(rates, dict):
-        raise RuntimeError("Frankfurter response has no rates")
-    values: dict[pd.Timestamp, float] = {}
-    for date_value, row in rates.items():
-        if not isinstance(row, dict):
-            continue
-        value = pd.to_numeric(row.get("CNY"), errors="coerce")
-        date = pd.to_datetime(date_value, errors="coerce")
-        if pd.notna(date) and pd.notna(value) and float(value) > 0:
-            values[pd.Timestamp(date).normalize()] = float(value)
-    series = _completed_daily_series(pd.Series(values, dtype=float))
-    if series.empty:
-        raise RuntimeError("Frankfurter returned no valid USD/CNY observations")
     return series
 
 
@@ -554,18 +607,10 @@ def fetch_ecb_usd_cny(session: requests.Session) -> pd.Series:
 def fetch_fx_usd_cny(
     session: requests.Session, start: str = "2005-01-01"
 ) -> tuple[pd.Series, str]:
-    """Fetch USD/CNY from independent providers, stopping at the first usable source."""
+    """Fetch USD/CNY from official central-bank sources only."""
     providers: list[tuple[str, Callable[[], pd.Series]]] = [
-        (
-            "Yahoo Finance CNY=X",
-            lambda: fetch_yahoo_adjusted_close(session, "CNY=X", start),
-        ),
-        ("ECB eurofxref-hist 官方参考汇率", lambda: fetch_ecb_usd_cny(session)),
-        (
-            "Frankfurter ECB reference rates",
-            lambda: fetch_frankfurter_usd_cny(session, start),
-        ),
         ("FRED DEXCHUS", lambda: fetch_fred_series(session, "DEXCHUS", start)),
+        ("ECB eurofxref-hist 官方参考汇率", lambda: fetch_ecb_usd_cny(session)),
     ]
     failures: list[str] = []
     for provider, fetch in providers:
@@ -586,6 +631,7 @@ def _status(
     series: pd.Series | None = None,
     fallback: bool = False,
     label: str | None = None,
+    source_url: str | None = None,
 ) -> dict[str, object]:
     return {
         "name": name,
@@ -594,8 +640,12 @@ def _status(
         "source": source,
         "message": message,
         "fallback": fallback,
+        "source_url": source_url or ASSET_META.get(name, {}).get("source_url"),
+        "checked_at": _utc_now(),
         "latest_date": _latest_date(series) if series is not None else None,
+        "latest_value": float(series.iloc[-1]) if series is not None and not series.empty else None,
         "rows": int(len(series)) if series is not None else 0,
+        "series_sha256": _series_digest(series),
     }
 
 
@@ -605,7 +655,9 @@ def _update_remote_series(
     name: str,
     label: str,
     source: str,
+    source_url: str,
     fetch: Callable[[], pd.Series | tuple[pd.Series, str]],
+    replace: bool = True,
 ) -> dict[str, object]:
     try:
         fetched = fetch()
@@ -614,14 +666,16 @@ def _update_remote_series(
             incoming, provider = fetched
         else:
             incoming = fetched
-        merged = store.merge_and_write(name, incoming)
+        incoming = _validate_official_series(name, incoming)
+        stored = store.replace_series(name, incoming) if replace else store.merge_and_write(name, incoming)
         return _status(
             name,
             "success",
             provider,
-            f"{provider} 数据已合并到本地",
-            merged,
+            f"{provider} 数据已替换本地历史" if replace else f"{provider} 数据已追加到本地",
+            stored,
             label=label,
+            source_url=source_url,
         )
     except Exception as exc:
         try:
@@ -634,28 +688,35 @@ def _update_remote_series(
                 cached,
                 fallback=True,
                 label=label,
+                source_url=source_url,
             )
         except Exception:
-            return _status(name, "error", source, str(exc), label=label)
+            return _status(name, "error", source, str(exc), label=label, source_url=source_url)
 
 
 def _refresh_remote_tasks(
     store: MarketStore,
     session: requests.Session,
-    tasks: list[tuple[str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]]]],
+    tasks: list[
+        tuple[str, str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]], bool]
+    ],
 ) -> list[dict[str, object]]:
     """Run remote tasks serially, retrying only failed tasks between rounds."""
     statuses: dict[str, dict[str, object]] = {}
-    for name, label, source, fetch in tasks:
-        statuses[name] = _update_remote_series(store, session, name, label, source, fetch)
+    for name, label, source, source_url, fetch, replace in tasks:
+        statuses[name] = _update_remote_series(
+            store, session, name, label, source, source_url, fetch, replace
+        )
 
     for retry_number in range(1, MAX_REFRESH_RETRIES + 1):
         failed_tasks = [task for task in tasks if statuses[task[0]]["status"] != "success"]
         if not failed_tasks:
             break
         time.sleep(REFRESH_RETRY_DELAY_SECONDS)
-        for name, label, source, fetch in failed_tasks:
-            retry_status = _update_remote_series(store, session, name, label, source, fetch)
+        for name, label, source, source_url, fetch, replace in failed_tasks:
+            retry_status = _update_remote_series(
+                store, session, name, label, source, source_url, fetch, replace
+            )
             if retry_status["status"] != "success":
                 retry_status = dict(retry_status)
                 retry_status["message"] = (
@@ -663,7 +724,7 @@ def _refresh_remote_tasks(
                 )
             statuses[name] = retry_status
 
-    return [statuses[name] for name, _, _, _ in tasks]
+    return [statuses[name] for name, _, _, _, _, _ in tasks]
 
 
 def _combine_cny_series(
@@ -675,10 +736,13 @@ def _combine_cny_series(
     try:
         usd = store.read_series(usd_name)
         fx = store.read_series("usd_cny")
-        frame = pd.concat({"usd": usd, "fx": fx}, axis=1).sort_index().ffill().dropna()
+        # Keep only ETF trading dates; forward-fill FX inside that date index.
+        frame = usd.rename("usd").to_frame().join(fx.rename("fx"), how="left")
+        frame["fx"] = frame["fx"].ffill()
+        frame = frame.dropna()
         frame = frame[(frame["usd"] > 0) & (frame["fx"] > 0)]
         cny = frame["usd"] * frame["fx"]
-        merged = store.merge_and_write(name, cny)
+        merged = store.replace_series(name, cny)
         dependency_warning = any(item["status"] != "success" for item in dependency_states)
         state = "warning" if dependency_warning else "success"
         fx_source = next(
@@ -688,7 +752,15 @@ def _combine_cny_series(
         message = f"美元价格与 USD/CNY（{fx_source}）已合并为人民币序列"
         if dependency_warning:
             message += "；部分远程依赖使用了本地缓存"
-        return _status(name, state, ASSET_META[name]["source"], message, merged, dependency_warning)
+        return _status(
+            name,
+            state,
+            ASSET_META[name]["source"],
+            message,
+            merged,
+            dependency_warning,
+            source_url=ASSET_META[name].get("source_url"),
+        )
     except Exception as exc:
         try:
             cached = store.read_series(name)
@@ -699,9 +771,16 @@ def _combine_cny_series(
                 f"人民币序列刷新失败，沿用本地数据：{exc}",
                 cached,
                 fallback=True,
+                source_url=ASSET_META[name].get("source_url"),
             )
         except Exception:
-            return _status(name, "error", ASSET_META[name]["source"], str(exc))
+            return _status(
+                name,
+                "error",
+                ASSET_META[name]["source"],
+                str(exc),
+                source_url=ASSET_META[name].get("source_url"),
+            )
 
 
 _REFRESH_LOCK = threading.Lock()
@@ -725,40 +804,55 @@ def _refresh_all(data_dir: Path | None = None) -> dict[str, object]:
     )
     statuses: list[dict[str, object]] = []
 
-    tasks: list[tuple[str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]]]] = []
-    domestic = [
-        ("dividend_low_vol", "512890"),
-        ("long_bond", "511260"),
-    ]
-    for asset, code in domestic:
-        tasks.append(
-            (
-                asset,
-                ASSET_META[asset]["label"],
-                ASSET_META[asset]["source"],
-                lambda code=code: fetch_domestic_daily(session, code),
-            )
+    tasks: list[
+        tuple[str, str, str, str, Callable[[], pd.Series | tuple[pd.Series, str]], bool]
+    ] = []
+    tasks.append(
+        (
+            "dividend_low_vol",
+            ASSET_META["dividend_low_vol"]["label"],
+            ASSET_META["dividend_low_vol"]["source"],
+            ASSET_META["dividend_low_vol"]["source_url"],
+            lambda: fetch_csindex_history(session, "H20269"),
+            True,
         )
+    )
+    tasks.append(
+        (
+            "long_bond",
+            ASSET_META["long_bond"]["label"],
+            ASSET_META["long_bond"]["source"],
+            ASSET_META["long_bond"]["source_url"],
+            lambda: fetch_domestic_daily(session, "511260"),
+            True,
+        )
+    )
 
     tasks.extend(
         [
             (
                 "usd_cny",
                 "USD/CNY",
-                "Yahoo Finance CNY=X -> ECB -> Frankfurter -> FRED",
+                "FRED DEXCHUS -> ECB 官方参考汇率",
+                f"{FRED_CSV_URL}?id=DEXCHUS",
                 lambda: fetch_fx_usd_cny(session),
+                True,
             ),
             (
                 "qqq_usd",
                 "QQQ美元价格",
-                "Yahoo Finance QQQ",
-                lambda: fetch_yahoo_adjusted_close(session, "QQQ"),
+                "Nasdaq 官方 QQQ 日线",
+                NASDAQ_HISTORICAL_URL.format(symbol="QQQ"),
+                lambda: fetch_nasdaq_historical(session, "QQQ", "etf"),
+                True,
             ),
             (
                 "gld_usd",
                 "GLD美元价格",
-                "Yahoo Finance GLD",
-                lambda: fetch_yahoo_adjusted_close(session, "GLD"),
+                "State Street 官方 GLD 历史归档",
+                GLD_HISTORICAL_ARCHIVE_URL,
+                lambda: fetch_gld_historical(session),
+                True,
             ),
         ]
     )
@@ -782,5 +876,13 @@ def _refresh_all(data_dir: Path | None = None) -> dict[str, object]:
         "error_count": len(errors),
         "items": statuses,
     }
+    if statuses and all(item["status"] == "success" for item in statuses):
+        try:
+            state = json.loads(store.schema_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if isinstance(state, dict):
+            state.update({"requires_refresh": False, "last_official_refresh": result["finished_at"]})
+            store._atomic_json(store.schema_path, state)
     store.append_refresh_log(result)
     return result

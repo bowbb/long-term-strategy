@@ -38,11 +38,56 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _stored_strategy_multipliers(store: MarketStore) -> dict[str, float]:
+    """Read the last calculated sleeve states when the store supports it."""
+    loader = getattr(store, "load_calculation", None)
+    if not callable(loader):
+        return {}
+    try:
+        calculation = loader()
+    except Exception:
+        return {}
+    rows = calculation.get("rows", []) if isinstance(calculation, dict) else []
+    stored: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("asset") not in RISK_ASSETS:
+            continue
+        market = row.get("market")
+        multiplier = market.get("multiplier") if isinstance(market, dict) else None
+        try:
+            value = float(multiplier)
+        except (TypeError, ValueError):
+            continue
+        if value in {0.0, 0.5, 1.0}:
+            stored[str(row["asset"])] = value
+    return stored
+
+
+def _previous_multiplier(
+    store: MarketStore,
+    asset: str,
+    holding: float,
+    current_total: float,
+    base_weight: float,
+) -> float:
+    """Infer the current state without turning a half position back to full."""
+    if holding <= 0.01 or current_total <= 0.0:
+        return 0.0
+
+    stored = _stored_strategy_multipliers(store).get(asset)
+    if stored in {0.5, 1.0}:
+        return stored
+
+    current_weight = holding / current_total
+    return 1.0 if current_weight >= base_weight * 0.75 else 0.5
+
+
 def _trend_snapshot(
     series: pd.Series,
     slow_days: int,
     hysteresis_band: float,
     previous_multiplier: Optional[float],
+    sell_multiplier: float = 0.5,
 ) -> Dict[str, Any]:
     observed = series.dropna().astype(float)
     result: Dict[str, Any] = {
@@ -72,8 +117,8 @@ def _trend_snapshot(
         multiplier = 1.0
         action = "switch_on"
     elif latest < lower_bound:
-        multiplier = 0.0
-        action = "switch_off"
+        multiplier = sell_multiplier if previous_multiplier != 0.0 else 0.0
+        action = "switch_to_half" if multiplier else "stay_off_below_band"
     elif previous_multiplier is None:
         multiplier = 1.0 if latest > ma250 else 0.0
         action = "initialize_from_ma250"
@@ -124,6 +169,7 @@ def _market_snapshot(store: MarketStore, asset: str, asof: pd.Timestamp) -> Dict
     config = load_config()
     slow_days = int(config["slow_ma_days"])
     hysteresis_band = float(config["hysteresis_band"])
+    sell_multiplier = float(config.get("sell_signal_multiplier", 0.5))
     try:
         series = store.read_series(asset).sort_index()
     except Exception as exc:
@@ -155,7 +201,7 @@ def _market_snapshot(store: MarketStore, asset: str, asof: pd.Timestamp) -> Dict
             "observations": 0,
         }
 
-    trend = _trend_snapshot(series, slow_days, hysteresis_band, None)
+    trend = _trend_snapshot(series, slow_days, hysteresis_band, None, sell_multiplier)
     latest_date = pd.Timestamp(series.index[-1]).normalize()
     return {
         "asset": asset,
@@ -185,11 +231,13 @@ def _commission(trade_value: float, rate: float, minimum: float) -> float:
 def _signal_text(trend: Mapping[str, Any]) -> str:
     action = str(trend["action"])
     if action == "switch_on":
-        return "突破上轨，策略转为持有"
-    if action == "switch_off":
-        return "跌破下轨，策略转为空仓"
+        return "突破上轨，恢复基础仓位"
+    if action == "switch_to_half":
+        return "跌破下轨，降至基础仓位50%"
+    if action == "stay_off_below_band":
+        return "低于下轨且当前无仓，继续空仓"
     if action == "hold_previous":
-        return "滞回区间内，暂时不动"
+        return "滞回区间内，保持当前状态"
     if action == "initialize_from_ma250":
         return "首次状态：持有" if float(trend["multiplier"]) == 1.0 else "首次状态：空仓"
     return "历史不足250日"
@@ -204,12 +252,24 @@ def calculate_plan(
     timestamp = pd.Timestamp(asof).normalize()
     slow_days = int(config["slow_ma_days"])
     hysteresis_band = float(config["hysteresis_band"])
+    sell_multiplier = float(config.get("sell_signal_multiplier", 0.5))
     release_to_cash = float(config["released_to_cash_ratio"])
     release_to_bond = 1.0 - release_to_cash
     commission_rate = float(config["commission_rate"])
     minimum_commission = float(config["minimum_commission"])
     base_weights = {asset: float(config["base_weights"][asset]) for asset in ALL_ASSETS}
     normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
+    current_total = sum(normalized_holdings.values())
+    previous_multipliers = {
+        asset: _previous_multiplier(
+            store,
+            asset,
+            normalized_holdings[asset],
+            current_total,
+            base_weights[asset],
+        )
+        for asset in RISK_ASSETS
+    }
 
     signal_date, execution_date = _signal_context(store, timestamp)
     prices = _aligned_prices(store, signal_date)
@@ -218,7 +278,8 @@ def calculate_plan(
             prices[asset],
             slow_days=slow_days,
             hysteresis_band=hysteresis_band,
-            previous_multiplier=1.0 if normalized_holdings[asset] > 0.0 else 0.0,
+            previous_multiplier=previous_multipliers[asset],
+            sell_multiplier=sell_multiplier,
         )
         for asset in RISK_ASSETS
     }
@@ -255,6 +316,12 @@ def calculate_plan(
         target_weights["long_bond"] += released * release_to_bond
         target_weights["cash"] += released * release_to_cash
         released_weight += released
+        if multiplier == 1.0:
+            destination = "不释放资金，保持基础仓位"
+        elif multiplier == sell_multiplier:
+            destination = "释放基础仓位的50%，其中各50%转入境内长期国债和人民币现金"
+        else:
+            destination = "当前无仓，继续保持空仓"
         process.append(
             {
                 "asset": asset,
@@ -262,7 +329,7 @@ def calculate_plan(
                 "base_weight": base,
                 "multiplier": multiplier,
                 "released_weight": released,
-                "destination": "释放部分各50%转入境内长期国债和人民币现金",
+                "destination": destination,
                 "action": trend["action"],
             }
         )
@@ -272,7 +339,6 @@ def calculate_plan(
         raise RuntimeError("目标权重计算失败。")
     target_weights = {asset: weight / total_weight for asset, weight in target_weights.items()}
 
-    current_total = sum(normalized_holdings.values())
     rows: list[Dict[str, Any]] = []
     total_commission = 0.0
     for asset in ALL_ASSETS:
@@ -343,6 +409,7 @@ def calculate_plan(
         "strategy": {
             "slow_ma_days": slow_days,
             "hysteresis_band": hysteresis_band,
+            "sell_signal_multiplier": sell_multiplier,
             "released_to_cash_ratio": release_to_cash,
             "released_to_bond_ratio": release_to_bond,
             "commission_rate": commission_rate,

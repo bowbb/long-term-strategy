@@ -1,6 +1,6 @@
 services:
   strategy-web:
-    image: ghcr.io/bowbb/long-term-strategy:1.2.0
+    image: ghcr.io/bowbb/long-term-strategy:1.3.0
     container_name: long-term-strategy
     ports:
       - "${PORT:-8000}:8000"

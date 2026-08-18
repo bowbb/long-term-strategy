@@ -202,7 +202,7 @@ def calculate():
 def settings():
     current = store.load_settings()
     logs = list(reversed(store.load_refresh_log()))[:20]
-    return render_template("settings.html", settings=current, logs=logs)
+    return render_template("settings.html", settings=current, logs=logs, asset_meta=ASSET_META)
 
 
 @app.post("/settings")

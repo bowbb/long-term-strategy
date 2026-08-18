@@ -1,0 +1,5 @@
+asset,official_native_start,effective_series_start,native_end,event_status,signal_paused
+dividend_low_vol,2005-01-01,2005-01-01,2026-08-17,verified,False
+nasdaq100,2016-08-17,2005-01-03,2026-08-17,verified,False
+gold,2005-01-03,2005-01-03,2026-08-17,verified_no_distribution,False
+long_bond,2017-08-24,2005-01-04,2026-08-17,verified,False

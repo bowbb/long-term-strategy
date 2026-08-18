@@ -1,0 +1,5 @@
+asset,native_start,native_end,return_basis,data_quality,period_return,total_return,price_return,price_return_provisional,cagr,max_drawdown
+dividend_low_vol,2005-01-01,2026-08-17,total_return_adjusted,verified,22.30491,22.30491,,,0.15674815810188902,-0.6616550242281927
+nasdaq100,2005-01-03,2026-08-17,total_return_adjusted,verified,16.684386684801915,16.684386684801915,,,0.14211679457709447,-0.5736094307534552
+gold,2005-01-03,2026-08-14,total_return_adjusted,verified_no_distribution,6.651029744900464,6.651029744900464,,,0.09873838598146167,-0.45555206205132526
+long_bond,2017-08-24,2026-08-17,total_return_adjusted,verified,0.40700056925520167,0.40700056925520167,,,0.03875603976718622,-0.04619648101508522
