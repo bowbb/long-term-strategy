@@ -734,6 +734,23 @@ def _combine_cny_series(
     dependency_states: list[dict[str, object]],
 ) -> dict[str, object]:
     try:
+        dependency_warning = any(item["status"] != "success" for item in dependency_states)
+        fx_source = next(
+            (str(item["source"]) for item in dependency_states if item["name"] == "usd_cny"),
+            "本地 USD/CNY",
+        )
+        if dependency_warning:
+            cached = store.read_series(name)
+            return _status(
+                name,
+                "warning",
+                "local_cache",
+                f"美元价格或 USD/CNY 刷新失败，沿用上一份人民币序列：{fx_source}",
+                cached,
+                fallback=True,
+                source_url=ASSET_META[name].get("source_url"),
+            )
+
         usd = store.read_series(usd_name)
         fx = store.read_series("usd_cny")
         # Keep only ETF trading dates; forward-fill FX inside that date index.
@@ -743,22 +760,14 @@ def _combine_cny_series(
         frame = frame[(frame["usd"] > 0) & (frame["fx"] > 0)]
         cny = frame["usd"] * frame["fx"]
         merged = store.replace_series(name, cny)
-        dependency_warning = any(item["status"] != "success" for item in dependency_states)
-        state = "warning" if dependency_warning else "success"
-        fx_source = next(
-            (str(item["source"]) for item in dependency_states if item["name"] == "usd_cny"),
-            "本地 USD/CNY",
-        )
         message = f"美元价格与 USD/CNY（{fx_source}）已合并为人民币序列"
-        if dependency_warning:
-            message += "；部分远程依赖使用了本地缓存"
         return _status(
             name,
-            state,
+            "success",
             ASSET_META[name]["source"],
             message,
             merged,
-            dependency_warning,
+            False,
             source_url=ASSET_META[name].get("source_url"),
         )
     except Exception as exc:

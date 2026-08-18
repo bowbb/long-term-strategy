@@ -12,8 +12,8 @@ The default run checks completed market days and uses each sleeve's raw
 close/NAV/index level for both the signal price and MA250. QQQ uses the v1test-compatible
 Yahoo Finance chart API (raw close for trading, adjusted close as the
 total-return reference); Nasdaq's QQQ history is fetched separately as an
-overlap cross-check. A sell requires two
-consecutive own trading days below `MA250 * 0.97`; a buy requires two above
+overlap cross-check. A sell requires one
+completed own trading day below `MA250 * 0.97`; a buy requires one above
 `MA250 * 1.03`. Execution is on the next available trading close. There is
 no additional position-drift gate: every confirmed sell signal is executed.
 `sell_all` sets the post-sale target to 0 and `sell_half` sets it to half of
@@ -26,8 +26,8 @@ purchase. Ordinary buys preserve the target cash sleeve (normally 5% of NAV).
 The default run adds CNY 10,000 on the first available portfolio trading day of
 each calendar month, then deploys the new cash to the current target weights.
 
-The monthly comparison keeps the same daily MA250 and the same two-own-trading-
-day confirmation. It only evaluates at the last available portfolio date of each
+The monthly comparison keeps the same daily MA250 and the configured confirmation
+period (one completed trading day by default). It only evaluates at the last available portfolio date of each
 calendar month, using the two most recent own trading days for confirmation;
 execution remains on the next available trading close. `monthly_10th` instead
 checks the completed trading day immediately before the first trading day on or
@@ -94,6 +94,6 @@ run one side only. Use
 
 Use `--low-vol-source h20269` (default) for the CSI H20269 total-return index,
 or `--low-vol-source 512890` for the SSE ETF raw-close comparison. Use
-`--confirmation-days 1` for a single completed trading-day confirmation;
-the default is two days. Use `--released-to-cash-ratio 0` to send all released
+`--confirmation-days` to test a multi-day confirmation; the default is one
+completed trading day. Use `--released-to-cash-ratio 0` to send all released
 money to long bonds.

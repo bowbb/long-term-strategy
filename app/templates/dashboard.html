@@ -5,7 +5,7 @@
   <div>
     <div class="eyebrow">MA250 ±3% HYSTERESIS / SELL TO HALF</div>
     <h1>本次投资计划</h1>
-    <p class="muted">计算日 {{ today }}。信号使用最新已完成交易日数据，金额按当前总资产计算。</p>
+    <p class="muted">计算日 {{ today }}。信号使用最近一次刷新后保存的完整历史，手动计算只读取本地数据，金额按当前总资产计算。</p>
   </div>
   <a class="button button-secondary" href="{{ url_for('settings') }}">刷新数据</a>
 </section>
@@ -69,6 +69,7 @@
   <div class="summary-item"><span>已完成数据日</span><strong>{{ calculation.signal_date }}</strong></div>
   <div class="summary-item"><span>计划执行日</span><strong>{{ calculation.execution_date }}</strong></div>
   <div class="summary-item"><span>预估佣金</span><strong>{{ calculation.estimated_commission|money }} 元</strong></div>
+  <div class="summary-item"><span>信号数据</span><strong>本地已刷新历史</strong></div>
 </section>
 
 <section class="panel result-panel">
@@ -112,9 +113,9 @@
 <section class="detail-grid">
   <section class="panel">
     <div class="panel-head"><h2>计算过程</h2></div>
-    <ol class="process-list">
+      <ol class="process-list">
       {% for item in calculation.process %}
-        <li>{{ item.name }}：基础 {{ item.base_weight|pct }} × 状态 {{ item.multiplier|pct }}；释放 {{ item.released_weight|pct }}。{{ item.destination }}。</li>
+        <li>{{ item.name }}：基础 {{ item.base_weight|pct }} × 状态 {{ item.multiplier|pct }}；释放 {{ item.released_weight|pct }}。{{ item.destination }}{% if item.last_signal_date %}；最近信号日 {{ item.last_signal_date }}{% endif %}。</li>
       {% endfor %}
     </ol>
   </section>
@@ -122,11 +123,12 @@
     <div class="panel-head"><h2>正式策略</h2></div>
     <dl class="strategy-list">
       <div><dt>基础配置</dt><dd>红利低波 30% / 纳斯达克100 50% / 黄金 10% / 境内长期国债 5% / 人民币现金 5%。</dd></div>
-      <div><dt>信号</dt><dd>每日判断：价格高于 MA250 上轨（+3%）恢复100%基础仓位；已持有风险资产且价格低于下轨（-3%）时降至50%基础仓位；价格位于区间内时保持当前状态。</dd></div>
-      <div><dt>首次投入</dt><dd>没有持仓且价格位于区间内或低于下轨时不主动建仓；后续突破上轨后建立100%基础仓位。已有半仓或满仓时，在区间内保持原状态。</dd></div>
-      <div><dt>执行</dt><dd>使用最新已完成交易日的信号，在下一个交易日调仓。风险资产状态为0%、50%或100%基础仓位。</dd></div>
+      <div><dt>信号</dt><dd>每日判断：从低到高突破 MA250 上轨（+3%）恢复100%基础仓位；从高到低突破下轨（-3%）降至50%基础仓位；价格位于区间内时保持最近一次穿越后的50%或100%状态。</dd></div>
+      <div><dt>首次投入</dt><dd>没有历史状态时，区间内按100%基础仓位初始化，低于下轨则按50%基础仓位初始化。后续新增资金仍按当前目标比例投入，不会因为滞回区间而停留在现金。</dd></div>
+      <div><dt>执行</dt><dd>使用最新已完成交易日的信号，在下一个交易日调仓。有效数据下风险资产状态只有50%和100%两种；历史不足250日时才由长期国债临时代替。</dd></div>
       <div><dt>释放资金</dt><dd>风险资产从满仓降至半仓时，释放其基础仓位的50%；释放资金各50%转入境内长期国债和人民币现金。基础5%国债和5%现金始终保留。</dd></div>
       <div><dt>缺失历史</dt><dd>风险资产有效历史不足250个交易日时，其基础权重全部转入境内长期国债。</dd></div>
+      <div><dt>数据口径</dt><dd>刷新时从中证指数、Nasdaq、State Street、FRED/ECB 和上交所接口全量下载并替换本地历史；手动计算只读取最近一次成功或回退保留的本地历史。</dd></div>
     </dl>
   </section>
 </section>

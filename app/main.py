@@ -153,21 +153,27 @@ def _input_values(values: dict[str, float]) -> dict[str, str]:
     return {asset: f"{float(values.get(asset, 0.0)):.2f}" for asset in ALL_ASSETS}
 
 
-def _dashboard(calculation=None, values=None, error=None):
+def _dashboard(calculation=None, values=None, error=None, signal_series=None):
     if values is None:
         values = store.load_portfolio_input()
     values = {asset: float(values.get(asset, 0.0)) for asset in ALL_ASSETS}
     today = _today()
     if calculation is None and sum(values.values()) > 0:
         try:
-            calculation = calculate_plan(store, values, today)
+            calculation = calculate_plan(
+                store,
+                values,
+                today,
+                use_crossing_history=True,
+                signal_data_mode="local_refreshed_history",
+            )
         except Exception as exc:
             error = error or str(exc)
     return render_template(
         "dashboard.html",
         calculation=calculation,
         values=_input_values(values),
-        overview=build_market_overview(store, today),
+        overview=build_market_overview(store, today, signal_series),
         today=today.strftime("%Y-%m-%d"),
         error=error,
         asset_meta=ASSET_META,
@@ -185,7 +191,13 @@ def calculate():
     try:
         values = _parse_holdings(request.form)
         store.save_portfolio_input(values)
-        result = calculate_plan(store, values, _today())
+        result = calculate_plan(
+            store,
+            values,
+            _today(),
+            use_crossing_history=True,
+            signal_data_mode="local_refreshed_history",
+        )
         store.save_calculation(result)
         return _dashboard(result, values)
     except Exception as exc:

@@ -33,8 +33,8 @@ class StrategyEngineTests(unittest.TestCase):
             "滞回区间内，保持当前状态",
         )
         self.assertEqual(
-            _signal_text({"action": "hold_previous", "multiplier": 0.0}),
-            "滞回区间内，保持当前状态",
+            _signal_text({"action": "insufficient_history", "multiplier": None}),
+            "历史不足250日",
         )
 
     def test_commission_is_zero_when_no_order_is_needed(self):
@@ -47,12 +47,15 @@ class StrategyEngineTests(unittest.TestCase):
         inside_band = pd.Series([100.0] * 249 + [102.0], index=index)
 
         held_on = _trend_snapshot(inside_band, 250, 0.03, 1.0)
-        held_off = _trend_snapshot(inside_band, 250, 0.03, 0.0)
+        initialized = _trend_snapshot(inside_band, 250, 0.03, None)
+        legacy_off = _trend_snapshot(inside_band, 250, 0.03, 0.0)
 
         self.assertTrue(held_on["available"])
         self.assertEqual(held_on["action"], "hold_previous")
         self.assertEqual(held_on["multiplier"], 1.0)
-        self.assertEqual(held_off["multiplier"], 0.0)
+        self.assertEqual(initialized["action"], "initialize_from_base")
+        self.assertEqual(initialized["multiplier"], 1.0)
+        self.assertEqual(legacy_off["multiplier"], 1.0)
 
     def test_hysteresis_switches_only_outside_three_percent_band(self):
         index = pd.bdate_range("2024-01-01", periods=250)
@@ -61,11 +64,78 @@ class StrategyEngineTests(unittest.TestCase):
 
         self.assertEqual(_trend_snapshot(above, 250, 0.03, 0.0)["multiplier"], 1.0)
         sell = _trend_snapshot(below, 250, 0.03, 1.0)
-        stay_off = _trend_snapshot(below, 250, 0.03, 0.0)
+        initial_sell = _trend_snapshot(below, 250, 0.03, 0.0)
         self.assertEqual(sell["multiplier"], 0.5)
         self.assertEqual(sell["action"], "switch_to_half")
-        self.assertEqual(stay_off["multiplier"], 0.0)
-        self.assertEqual(stay_off["action"], "stay_off_below_band")
+        self.assertEqual(initial_sell["multiplier"], 0.5)
+        self.assertEqual(initial_sell["action"], "switch_to_half")
+
+    def test_history_crossing_keeps_last_half_signal_inside_band(self):
+        index = pd.bdate_range("2024-01-01", periods=252)
+        values = [100.0] * 250 + [96.0, 100.0]
+        series = pd.Series(values, index=index)
+
+        snapshot = _trend_snapshot(
+            series,
+            250,
+            0.03,
+            None,
+            use_crossing_history=True,
+        )
+
+        self.assertEqual(snapshot["multiplier"], 0.5)
+        self.assertEqual(snapshot["action"], "hold_previous")
+        self.assertEqual(snapshot["last_signal"], "lower_break")
+        self.assertEqual(snapshot["last_signal_date"], index[-2].date().isoformat())
+
+    def test_history_crossing_restores_full_state_after_upper_break(self):
+        index = pd.bdate_range("2024-01-01", periods=252)
+        values = [100.0] * 250 + [96.0, 104.0]
+        series = pd.Series(values, index=index)
+
+        snapshot = _trend_snapshot(
+            series,
+            250,
+            0.03,
+            None,
+            use_crossing_history=True,
+        )
+
+        self.assertEqual(snapshot["multiplier"], 1.0)
+        self.assertEqual(snapshot["action"], "switch_on")
+        self.assertEqual(snapshot["last_signal"], "upper_break")
+        self.assertEqual(snapshot["last_signal_date"], index[-1].date().isoformat())
+
+    def test_local_plan_uses_downloaded_history_crossings(self):
+        index = pd.bdate_range("2024-01-01", periods=252)
+        dividend = pd.Series([100.0] * 250 + [96.0, 100.0], index=index)
+        flat = pd.Series(100.0, index=index)
+        store = MemoryStore(
+            {
+                "dividend_low_vol": dividend,
+                "nasdaq100": flat,
+                "gold": flat,
+                "long_bond": flat,
+            }
+        )
+        holdings = {
+            "dividend_low_vol": 0.0,
+            "nasdaq100": 500.0,
+            "gold": 0.0,
+            "long_bond": 0.0,
+            "cash": 500.0,
+        }
+
+        plan = calculate_plan(
+            store,
+            holdings,
+            index[-1] + pd.Timedelta(days=1),
+            use_crossing_history=True,
+            signal_data_mode="local_refreshed_history",
+        )
+
+        self.assertAlmostEqual(plan["target_weights"]["dividend_low_vol"], 0.15)
+        self.assertEqual(plan["strategy"]["signal_state_source"], "downloaded_history_crossings")
 
     def test_signal_uses_latest_completed_day_and_calculation_day_for_execution(self):
         calendar = pd.bdate_range("2020-01-01", "2021-03-04")
@@ -94,7 +164,7 @@ class StrategyEngineTests(unittest.TestCase):
         uninvested_plan = calculate_plan(store, uninvested, pd.Timestamp("2021-03-05"))
 
         self.assertAlmostEqual(invested_plan["target_weights"]["dividend_low_vol"], 0.30)
-        self.assertAlmostEqual(uninvested_plan["target_weights"]["dividend_low_vol"], 0.0)
+        self.assertAlmostEqual(uninvested_plan["target_weights"]["dividend_low_vol"], 0.30)
         invested_row = next(row for row in invested_plan["rows"] if row["asset"] == "dividend_low_vol")
         uninvested_row = next(row for row in uninvested_plan["rows"] if row["asset"] == "dividend_low_vol")
         self.assertEqual(invested_row["signal_text"], "滞回区间内，保持当前状态")
@@ -129,6 +199,35 @@ class StrategyEngineTests(unittest.TestCase):
             next(row for row in plan["rows"] if row["asset"] == "dividend_low_vol")["market"]["multiplier"],
             0.5,
         )
+
+    def test_half_position_reallocates_released_weight_to_bond_and_cash(self):
+        calendar = pd.bdate_range("2019-01-01", "2021-03-04")
+        flat = pd.Series(100.0, index=calendar)
+        dividend_below = flat.copy()
+        dividend_below.iloc[-1] = 96.0
+        store = MemoryStore(
+            {
+                "dividend_low_vol": dividend_below,
+                "nasdaq100": flat,
+                "gold": flat,
+                "long_bond": flat,
+            }
+        )
+        holdings = {
+            "dividend_low_vol": 0.0,
+            "nasdaq100": 0.0,
+            "gold": 0.0,
+            "long_bond": 0.0,
+            "cash": 1000.0,
+        }
+
+        plan = calculate_plan(store, holdings, pd.Timestamp("2021-03-05"))
+
+        self.assertAlmostEqual(plan["target_weights"]["dividend_low_vol"], 0.15)
+        self.assertAlmostEqual(plan["target_weights"]["nasdaq100"], 0.50)
+        self.assertAlmostEqual(plan["target_weights"]["gold"], 0.10)
+        self.assertAlmostEqual(plan["target_weights"]["long_bond"], 0.125)
+        self.assertAlmostEqual(plan["target_weights"]["cash"], 0.125)
 
     def test_missing_history_moves_entire_base_weight_to_long_bond(self):
         calendar = pd.bdate_range("2019-01-01", "2021-03-05")

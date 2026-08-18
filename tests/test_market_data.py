@@ -150,6 +150,28 @@ class MarketDataTests(unittest.TestCase):
         self.assertAlmostEqual(store.read_series("nasdaq100").loc[dates[-1]], 101.0 * 7.1)
         self.assertEqual(list(store.read_series("nasdaq100").index), list(dates))
 
+    def test_derived_cny_series_keeps_previous_cache_when_dependency_fails(self):
+        store = MemoryStore()
+        dates = pd.date_range("2030-01-02", periods=2, freq="D")
+        store.write_series("qqq_usd", pd.Series([100.0, 101.0], index=dates))
+        store.write_series("usd_cny", pd.Series([7.0, 7.1], index=dates))
+        previous = pd.Series([600.0, 601.0], index=dates)
+        store.write_series("nasdaq100", previous)
+
+        status = _combine_cny_series(
+            store,
+            "nasdaq100",
+            "qqq_usd",
+            [
+                {"name": "usd_cny", "status": "warning", "source": "local_cache"},
+                {"name": "qqq_usd", "status": "success", "source": "Nasdaq 官方 QQQ 日线"},
+            ],
+        )
+
+        self.assertEqual(status["status"], "warning")
+        self.assertTrue(status["fallback"])
+        pd.testing.assert_series_equal(store.read_series("nasdaq100"), previous)
+
     def test_market_store_rejects_implicit_scale_change(self):
         store = MarketStore(Path("."))
         dates = pd.date_range("2026-08-13", periods=2, freq="D")

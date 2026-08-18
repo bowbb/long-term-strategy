@@ -43,7 +43,7 @@ h2 { font-size: 17px; }
 .flash-stack { display: grid; gap: 8px; margin-bottom: 18px; }
 .flash, .notice { border: 1px solid; border-radius: 5px; padding: 11px 14px; }
 .flash-success { background: #eaf6ef; border-color: #b6dfc7; color: #155c3d; }
-.flash-warning { background: #fff8e7; border-color: #ead499; color: #75500d; }
+.flash-warning, .notice-warning { background: #fff8e7; border-color: #ead499; color: #75500d; }
 .flash-error, .notice-error { background: #fff0ee; border-color: #e4b6b1; color: #843b37; }
 .notice { margin-bottom: 18px; }
 .workspace-grid, .detail-grid, .settings-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr); gap: 18px; align-items: start; }
