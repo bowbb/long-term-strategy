@@ -9,6 +9,47 @@
   </div>
 </section>
 
+<section class="panel allocation-panel">
+  <div class="panel-head allocation-head">
+    <div>
+      <h2>投资比例</h2>
+      <p class="muted">设置各类资产的基础权重，策略信号触发后会在此基础上计算目标仓位。</p>
+    </div>
+    <div class="allocation-total" data-allocation-total-wrap>
+      <span>合计</span>
+      <strong data-allocation-total>100.0%</strong>
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('save_allocation') }}" data-allocation-form>
+    <div class="allocation-bar" aria-label="当前投资比例">
+      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond', 'cash'] %}
+        <span class="allocation-segment asset-{{ asset }}" data-allocation-segment="{{ asset }}" style="width: {{ base_weights[asset] * 100 }}%" title="{{ asset_meta[asset].label }} {{ base_weights[asset]|pct }}"></span>
+      {% endfor %}
+    </div>
+    <div class="allocation-list">
+      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond', 'cash'] %}
+        <label class="allocation-row" for="weight_{{ asset }}">
+          <span class="allocation-asset">
+            <span class="asset-swatch asset-{{ asset }}" aria-hidden="true"></span>
+            <span>
+              <strong>{{ asset_meta[asset].label }}</strong>
+              <small>{{ asset_meta[asset].instrument }}</small>
+            </span>
+          </span>
+          <span class="percent-input">
+            <input id="weight_{{ asset }}" name="weight_{{ asset }}" type="number" min="0" max="100" step="0.1" value="{{ '%.1f'|format(base_weights[asset] * 100) }}" inputmode="decimal" data-allocation-input="{{ asset }}" required>
+            <span>%</span>
+          </span>
+        </label>
+      {% endfor %}
+    </div>
+    <div class="allocation-actions">
+      <span class="allocation-validation" data-allocation-validation aria-live="polite">比例合计正确</span>
+      <button class="button button-primary" type="submit" data-allocation-submit>保存比例</button>
+    </div>
+  </form>
+</section>
+
 <section class="settings-grid">
   <section class="panel">
     <div class="panel-head"><h2>每日自动刷新</h2></div>
@@ -92,4 +133,7 @@
     </table>
   </div>
 </section>
+{% endblock %}
+{% block scripts %}
+  <script src="{{ url_for('static', filename='settings.js') }}" defer></script>
 {% endblock %}

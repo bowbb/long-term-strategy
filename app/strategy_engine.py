@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -29,6 +30,26 @@ def _asset_label(asset: str) -> str:
 
 def load_config() -> Dict[str, Any]:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def effective_base_weights(store: MarketStore | None = None) -> dict[str, float]:
+    defaults = {asset: float(load_config()["base_weights"][asset]) for asset in ALL_ASSETS}
+    if store is None:
+        return defaults
+
+    loader = getattr(store, "load_settings", None)
+    if not callable(loader):
+        return defaults
+    try:
+        configured = loader().get("base_weights")
+        weights = {asset: float(configured[asset]) for asset in ALL_ASSETS}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return defaults
+    if any(not math.isfinite(value) or value < 0 for value in weights.values()):
+        return defaults
+    if not math.isclose(sum(weights.values()), 1.0, abs_tol=1e-6):
+        return defaults
+    return weights
 
 
 def _as_float(value: Any) -> float:
@@ -346,7 +367,7 @@ def calculate_plan(
     release_to_bond = 1.0 - release_to_cash
     commission_rate = float(config["commission_rate"])
     minimum_commission = float(config["minimum_commission"])
-    base_weights = {asset: float(config["base_weights"][asset]) for asset in ALL_ASSETS}
+    base_weights = effective_base_weights(store)
     normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
     current_total = sum(normalized_holdings.values())
     use_crossing_history = use_crossing_history or signal_series is not None

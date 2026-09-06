@@ -20,6 +20,11 @@ from app.market_data import (
 from app.strategy_engine import build_market_overview
 
 
+TODAY_CN = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
+LATEST_SAMPLE_DATE = TODAY_CN - pd.Timedelta(days=1)
+PREVIOUS_SAMPLE_DATE = LATEST_SAMPLE_DATE - pd.Timedelta(days=1)
+
+
 class FakeResponse:
     def __init__(self, *, json_data=None, content=b"", text=""):
         self._json_data = json_data
@@ -61,8 +66,8 @@ class OfficialSseSession:
             return FakeResponse(
                 json_data={
                     "kline": [
-                        [20260813, 1.15, 1.16, 1.14, 1.157, 1, 1],
-                        [20260814, 1.157, 1.161, 1.151, 1.155, 1, 1],
+                        [int(PREVIOUS_SAMPLE_DATE.strftime("%Y%m%d")), 1.15, 1.16, 1.14, 1.157, 1, 1],
+                        [int(LATEST_SAMPLE_DATE.strftime("%Y%m%d")), 1.157, 1.161, 1.151, 1.155, 1, 1],
                     ]
                 }
             )
@@ -75,8 +80,8 @@ class OfficialCsindexSession:
             return FakeResponse(
                 json_data={
                     "data": [
-                        {"tradeDate": "20260813", "close": "1234.56"},
-                        {"tradeDate": "20260814", "close": "1238.91"},
+                        {"tradeDate": PREVIOUS_SAMPLE_DATE.strftime("%Y%m%d"), "close": "1234.56"},
+                        {"tradeDate": LATEST_SAMPLE_DATE.strftime("%Y%m%d"), "close": "1238.91"},
                     ]
                 }
             )
@@ -117,7 +122,7 @@ class MarketDataTests(unittest.TestCase):
         series, provider = fetch_sse_daily(OfficialSseSession(), "512890", start="2026-01-01")
 
         self.assertEqual(provider, "SSE 官方日线 512890")
-        self.assertAlmostEqual(series.loc[pd.Timestamp("2026-08-14")], 1.155)
+        self.assertAlmostEqual(series.loc[LATEST_SAMPLE_DATE], 1.155)
 
     def test_csindex_parser_returns_total_return_close(self):
         series, provider = fetch_csindex_history(
@@ -125,7 +130,7 @@ class MarketDataTests(unittest.TestCase):
         )
 
         self.assertEqual(provider, "中证指数官方 H20269 全收益指数")
-        self.assertAlmostEqual(series.loc[pd.Timestamp("2026-08-14")], 1238.91)
+        self.assertAlmostEqual(series.loc[LATEST_SAMPLE_DATE], 1238.91)
 
     def test_official_cny_combination_replaces_history(self):
         store = MemoryStore()

@@ -307,18 +307,21 @@ class MarketStore:
         self.write_series(name, merged)
         return merged
 
-    def load_settings(self) -> dict[str, str]:
+    def load_settings(self) -> dict[str, object]:
         self.ensure_store()
         try:
             raw = json.loads(self.settings_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             raw = {}
-        return {
+        settings: dict[str, object] = {
             "refresh_time": str(raw.get("refresh_time", "06:30")),
             "timezone": str(raw.get("timezone", os.environ.get("TZ", "Asia/Shanghai"))),
         }
+        if isinstance(raw.get("base_weights"), dict):
+            settings["base_weights"] = raw["base_weights"]
+        return settings
 
-    def save_settings(self, settings: dict[str, str]) -> None:
+    def save_settings(self, settings: dict[str, object]) -> None:
         self._atomic_json(self.settings_path, settings)
 
     def load_refresh_log(self) -> list[dict[str, object]]:

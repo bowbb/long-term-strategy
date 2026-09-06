@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, flash, redirect, render_template, request, url_for
 
 from .market_data import ASSET_META, MarketStore, refresh_all
-from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan, load_config
+from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan, effective_base_weights
 
 
 app = Flask(__name__)
@@ -123,6 +124,23 @@ def _parse_holdings(form) -> dict[str, float]:
     return values
 
 
+def _parse_base_weights(form) -> dict[str, float]:
+    percentages: dict[str, float] = {}
+    for asset in ALL_ASSETS:
+        raw = str(form.get(f"weight_{asset}", "")).strip().replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{ASSET_META[asset]['label']} 的比例不是有效数字") from exc
+        if not math.isfinite(value) or value < 0 or value > 100:
+            raise ValueError(f"{ASSET_META[asset]['label']} 的比例必须在 0% 到 100% 之间")
+        percentages[asset] = value
+    total = sum(percentages.values())
+    if not math.isclose(total, 100.0, abs_tol=0.01):
+        raise ValueError(f"投资比例合计必须为 100%，当前为 {total:.1f}%")
+    return {asset: value / total for asset, value in percentages.items()}
+
+
 def _record_refresh_exception(exc: Exception) -> None:
     now = datetime.now(timezone.utc).isoformat()
     store.append_refresh_log(
@@ -177,7 +195,7 @@ def _dashboard(calculation=None, values=None, error=None, signal_series=None):
         today=today.strftime("%Y-%m-%d"),
         error=error,
         asset_meta=ASSET_META,
-        base_weights=load_config()["base_weights"],
+        base_weights=effective_base_weights(store),
     )
 
 
@@ -214,7 +232,13 @@ def calculate():
 def settings():
     current = store.load_settings()
     logs = list(reversed(store.load_refresh_log()))[:20]
-    return render_template("settings.html", settings=current, logs=logs, asset_meta=ASSET_META)
+    return render_template(
+        "settings.html",
+        settings=current,
+        logs=logs,
+        asset_meta=ASSET_META,
+        base_weights=effective_base_weights(store),
+    )
 
 
 @app.post("/settings")
@@ -230,9 +254,24 @@ def save_settings():
         flash("刷新时间格式必须是 00:00 到 23:59。", "error")
         return redirect(url_for("settings"))
     current = store.load_settings()
-    store.save_settings({"refresh_time": f"{hour:02d}:{minute:02d}", "timezone": current["timezone"]})
+    current.update({"refresh_time": f"{hour:02d}:{minute:02d}", "timezone": current["timezone"]})
+    store.save_settings(current)
     _scheduler_wakeup.set()
     flash(f"每日刷新时间已设置为 {hour:02d}:{minute:02d}（{current['timezone']}）。", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/allocation")
+def save_allocation():
+    try:
+        base_weights = _parse_base_weights(request.form)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("settings"))
+    current = store.load_settings()
+    current["base_weights"] = base_weights
+    store.save_settings(current)
+    flash("投资比例已保存，并会用于后续目标仓位计算。", "success")
     return redirect(url_for("settings"))
 
 
