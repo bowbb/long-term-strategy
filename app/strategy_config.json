@@ -1,7 +1,7 @@
 {
   "base_weights": {
-    "dividend_low_vol": 0.3,
     "nasdaq100": 0.5,
+    "dividend_low_vol": 0.3,
     "gold": 0.1,
     "long_bond": 0.05,
     "cash": 0.05

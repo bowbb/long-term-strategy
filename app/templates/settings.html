@@ -13,7 +13,7 @@
   <div class="panel-head allocation-head">
     <div>
       <h2>投资比例</h2>
-      <p class="muted">设置各类资产的基础权重，策略信号触发后会在此基础上计算目标仓位。</p>
+      <p class="muted">纳指不择时，参与每月再平衡；红利低波与黄金采用 MA250 ±3% 滞回，跌破下轨降至半仓。</p>
     </div>
     <div class="allocation-total" data-allocation-total-wrap>
       <span>合计</span>
@@ -22,12 +22,12 @@
   </div>
   <form method="post" action="{{ url_for('save_allocation') }}" data-allocation-form>
     <div class="allocation-bar" aria-label="当前投资比例">
-      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond', 'cash'] %}
+      {% for asset in asset_meta %}
         <span class="allocation-segment asset-{{ asset }}" data-allocation-segment="{{ asset }}" style="width: {{ base_weights[asset] * 100 }}%" title="{{ asset_meta[asset].label }} {{ base_weights[asset]|pct }}"></span>
       {% endfor %}
     </div>
     <div class="allocation-list">
-      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond', 'cash'] %}
+      {% for asset in asset_meta %}
         <label class="allocation-row" for="weight_{{ asset }}">
           <span class="allocation-asset">
             <span class="asset-swatch asset-{{ asset }}" aria-hidden="true"></span>
@@ -48,6 +48,48 @@
       <button class="button button-primary" type="submit" data-allocation-submit>保存比例</button>
     </div>
   </form>
+</section>
+
+<section class="panel housing-panel">
+  <div class="panel-head">
+    <div>
+      <div class="eyebrow">买房资金安排</div>
+      <h2>买房计划</h2>
+      <p class="muted">购房前一年预留预算的一半，余下一半在接下来的12个月补齐。购房资金单列，剩余资金照常按基础比例和风控规则投资；长期国债总目标为普通策略国债与购房资金之和。</p>
+    </div>
+    <span class="tag">{{ '已启用' if housing.enabled else '未启用' }}</span>
+  </div>
+  <form method="post" action="{{ url_for('save_housing') }}" class="housing-form" data-housing-form>
+    <label class="housing-toggle"><input type="checkbox" name="housing_enabled" {% if housing.enabled %}checked{% endif %} data-housing-enabled> 启用买房资金预留</label>
+    <div class="housing-fields">
+      <label for="purchase_month">计划买房年月（公历）
+        <input id="purchase_month" name="purchase_month" type="month" min="1901-01" max="9998-12" value="{{ housing.purchase_month }}" data-housing-month>
+      </label>
+      <label for="target_amount">计划花多少钱（元）<small>参考金额：总资产的 1/2–2/3，金额由你决定</small>
+        <input id="target_amount" name="target_amount" type="number" min="0" step="0.01" value="{{ '%.2f'|format(housing.target_amount) }}" inputmode="decimal" data-housing-amount>
+      </label>
+    </div>
+    <p class="housing-preview" data-housing-preview aria-live="polite"></p>
+    <div class="allocation-actions">
+      <span class="muted">完成交易后，只需更新长期国债总市值。未启用时，计算页显示普通投资计划。</span>
+      <button class="button button-primary" type="submit">保存买房计划</button>
+    </div>
+  </form>
+  {% if housing.enabled %}
+  <details class="housing-schedule">
+    <summary>查看已保存的提取安排 · {{ housing.start_month }} 至 {{ housing.purchase_month }}</summary>
+    <div class="table-scroll">
+      <table class="data-table compact-table">
+        <thead><tr><th>月份</th><th>当月计划转入国债（元）</th><th>累计购房专款（元）</th></tr></thead>
+        <tbody>
+        {% for step in housing.schedule %}
+          <tr><td>{{ step.month }}{% if loop.first %} · 首次50%{% elif loop.last %} · 买房当月{% endif %}</td><td>{{ step.amount|money }}</td><td>{{ step.cumulative|money }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
 </section>
 
 <section class="settings-grid">
@@ -99,7 +141,7 @@
     <table class="data-table compact-table">
       <thead><tr><th>资产</th><th>交易标的</th><th>来源</th><th>核验</th></tr></thead>
       <tbody>
-      {% for asset in ['dividend_low_vol', 'nasdaq100', 'gold', 'long_bond'] %}
+      {% for asset in ['nasdaq100', 'dividend_low_vol', 'gold', 'long_bond'] %}
         {% set meta = asset_meta[asset] %}
         <tr>
           <td>{{ meta.label }}</td>

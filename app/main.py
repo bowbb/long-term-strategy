@@ -10,6 +10,7 @@ from flask import Flask, flash, redirect, render_template, request, url_for
 
 from .market_data import ASSET_META, MarketStore, refresh_all
 from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan, effective_base_weights
+from .housing import housing_schedule, validate_housing
 
 
 app = Flask(__name__)
@@ -116,8 +117,8 @@ def _parse_holdings(form) -> dict[str, float]:
             value = float(raw or 0.0)
         except ValueError as exc:
             raise ValueError(f"{ASSET_META[asset]['label']} 的金额不是有效数字") from exc
-        if value < 0:
-            raise ValueError(f"{ASSET_META[asset]['label']} 的金额不能为负数")
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{ASSET_META[asset]['label']} 的金额必须是非负的有限数字")
         values[asset] = value
     if sum(values.values()) <= 0:
         raise ValueError("当前持仓和现金合计必须大于0")
@@ -176,7 +177,7 @@ def _dashboard(calculation=None, values=None, error=None, signal_series=None):
         values = store.load_portfolio_input()
     values = {asset: float(values.get(asset, 0.0)) for asset in ALL_ASSETS}
     today = _today()
-    if calculation is None and sum(values.values()) > 0:
+    if calculation is None and sum(values[asset] for asset in ALL_ASSETS) > 0 and not error:
         try:
             calculation = calculate_plan(
                 store,
@@ -196,6 +197,7 @@ def _dashboard(calculation=None, values=None, error=None, signal_series=None):
         error=error,
         asset_meta=ASSET_META,
         base_weights=effective_base_weights(store),
+        housing=housing_schedule(store.load_settings().get("housing"), today),
     )
 
 
@@ -208,7 +210,6 @@ def dashboard():
 def calculate():
     try:
         values = _parse_holdings(request.form)
-        store.save_portfolio_input(values)
         result = calculate_plan(
             store,
             values,
@@ -216,13 +217,15 @@ def calculate():
             use_crossing_history=True,
             signal_data_mode="local_refreshed_history",
         )
+        store.save_portfolio_input(values)
         store.save_calculation(result)
         return _dashboard(result, values)
     except Exception as exc:
         values = {}
         for asset in ALL_ASSETS:
             try:
-                values[asset] = max(float(request.form.get(f"holding_{asset}", 0) or 0), 0.0)
+                value = float(str(request.form.get(f"holding_{asset}", 0)).replace(",", "") or 0)
+                values[asset] = max(value, 0.0) if math.isfinite(value) else 0.0
             except ValueError:
                 values[asset] = 0.0
         return _dashboard(values=values, error=str(exc)), 400
@@ -238,6 +241,7 @@ def settings():
         logs=logs,
         asset_meta=ASSET_META,
         base_weights=effective_base_weights(store),
+        housing=housing_schedule(current.get("housing"), _today()),
     )
 
 
@@ -272,6 +276,28 @@ def save_allocation():
     current["base_weights"] = base_weights
     store.save_settings(current)
     flash("投资比例已保存，并会用于后续目标仓位计算。", "success")
+    return redirect(url_for("settings"))
+
+
+@app.post("/settings/housing")
+def save_housing():
+    try:
+        housing = validate_housing({
+            "enabled": request.form.get("housing_enabled"),
+            "purchase_month": request.form.get("purchase_month"),
+            "target_amount": str(request.form.get("target_amount", "")).strip().replace(",", ""),
+        })
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("settings"))
+    current = store.load_settings()
+    current["housing"] = housing
+    store.save_settings(current)
+    flash(
+        "买房计划已启用，购房资金与普通策略国债分行计算，合计持有。" if housing["enabled"]
+        else "买房计划已停用，计算页恢复普通投资计划。",
+        "success",
+    )
     return redirect(url_for("settings"))
 
 

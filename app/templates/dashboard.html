@@ -3,9 +3,9 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <div class="eyebrow">MA250 ±3% HYSTERESIS / SELL TO HALF</div>
+    <div class="eyebrow">纳指固定配置 · 红利 / 黄金 MA250 ±3%</div>
     <h1>本次投资计划</h1>
-    <p class="muted">计算日 {{ today }}。信号使用最近一次刷新后保存的完整历史，手动计算只读取本地数据，金额按当前总资产计算。</p>
+    <p class="muted">计算日 {{ today }}。每月按目标再平衡，纳指不择时。信号使用本地已刷新历史{% if housing.enabled %}；购房资金按进度单列，剩余资金照常按基础比例与风控规则分配{% endif %}。</p>
   </div>
   <a class="button button-secondary" href="{{ url_for('settings') }}">刷新数据</a>
 </section>
@@ -30,18 +30,21 @@
         {% for asset, meta in asset_meta.items() %}
           <tr>
             <td><strong>{{ meta.label }}</strong><span class="cell-note">{{ asset }}</span></td>
-            <td><input class="amount-input" type="number" min="0" step="0.01" name="holding_{{ asset }}" value="{{ values[asset] }}" inputmode="decimal"></td>
+            <td><input class="amount-input" aria-label="{{ meta.label }}当前市值" type="number" min="0" step="0.01" name="holding_{{ asset }}" value="{{ values[asset] }}" inputmode="decimal"></td>
             <td>{{ base_weights[asset]|pct }}</td>
           </tr>
         {% endfor %}
         </tbody>
       </table>
     </div>
+    {% if housing.enabled %}
+    <p class="muted">长期国债填写普通投资与购房资金的合计市值。计算时按购房进度拆分，无需额外填写；交易后更新实际持仓。</p>
+    {% endif %}
   </form>
 
   <section class="panel">
     <div class="panel-head">
-      <div><h2>最新数据概览</h2><p class="muted">每日收盘数据完成后更新信号，次日按目标调仓。</p></div>
+      <div><h2>最新数据概览</h2><p class="muted">每日收盘数据更新信号；月度执行时按最新目标再平衡。纳指行情仅供参考，不参与均线择时。</p></div>
     </div>
     <div class="table-scroll">
       <table class="data-table compact-table">
@@ -63,9 +66,43 @@
   </section>
 </section>
 
+{% if housing.enabled %}
+<section class="panel housing-panel">
+  <div class="panel-head">
+    <div><h2>买房资金提取指引</h2><p class="muted">计划 {{ housing.purchase_month }} 买房，预算 {{ housing.target_amount|money }} 元。{{ housing.start_month }} 先预留50%，其后12个月补齐。</p></div>
+    <a class="button button-secondary" href="{{ url_for('settings') }}#purchase_month">调整买房计划</a>
+  </div>
+  {% if calculation %}
+  <div class="housing-stats">
+    <div><span>截至本月应累计预留</span><strong>{{ calculation.housing.required_amount|money }} 元</strong></div>
+    <div><span>国债中已划分的购房资金</span><strong>{{ calculation.housing.current_reserved|money }} 元</strong></div>
+    <div><span>国债合计目标（投资＋购房）</span><strong>{{ calculation.housing.bond_total_target|money }} 元</strong></div>
+    <div><span>国债实际净买卖</span><strong class="{% if calculation.housing.bond_net_trade >= 0 %}positive{% else %}negative{% endif %}">{{ calculation.housing.bond_net_trade|signed_money }} 元</strong></div>
+  </div>
+  {% if calculation.housing.shortfall > 0.01 %}
+    <p class="notice notice-warning">当前总资产不足以完成本月预留，尚缺 {{ calculation.housing.shortfall|money }} 元。已优先按可用金额生成转入计划。</p>
+  {% endif %}
+  {% if calculation.housing.phase == 'waiting' %}
+    <p class="muted">尚未进入提取期，首次提取月份为 {{ housing.start_month }}。</p>
+  {% elif calculation.housing.phase == 'purchase' %}
+    <p class="muted">已到或已过计划购房月，按全额预算检查预留。买房支付后，请更新实际持仓并停用已完成的买房计划。</p>
+  {% endif %}
+  <p class="muted">购房资金按截至本月的累计计划额单列；剩余资金继续按50/30等基础比例与风控规则分配。普通国债目标与购房资金目标相加，得到国债合计目标。现有国债不足累计购房计划时，先划入已有国债，缺口在购房资金行提示补齐。</p>
+  {% else %}
+    <p class="muted">截至本月应累计预留 {{ housing.required_amount|money }} 元。填写持仓并计算后，即可查看具体提取与交易金额。</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% if calculation %}
+{% if calculation.stale_signal %}
+<div class="notice notice-warning">本地信号数据截至 {{ calculation.signal_date }}，距计算日已超过14天。请先在设置页刷新数据，再按更新后的目标执行交易。</div>
+{% endif %}
 <section class="summary-grid">
   <div class="summary-item"><span>当前总资产</span><strong>{{ calculation.current_total|money }} 元</strong></div>
+  {% if housing.enabled %}
+  <div class="summary-item"><span>扣除购房款后的投资资金</span><strong>{{ calculation.investment_total|money }} 元</strong></div>
+  {% endif %}
   <div class="summary-item"><span>已完成数据日</span><strong>{{ calculation.signal_date }}</strong></div>
   <div class="summary-item"><span>计划执行日</span><strong>{{ calculation.execution_date }}</strong></div>
   <div class="summary-item"><span>预估佣金</span><strong>{{ calculation.estimated_commission|money }} 元</strong></div>
@@ -76,7 +113,7 @@
   <div class="panel-head">
     <div>
       <h2>目标权重与交易金额</h2>
-      <p class="muted">正数表示增加，负数表示减少；佣金按 ETF 每笔万0.6、最低0.3元估算，并应从现金中预留。</p>
+      <p class="muted">{{ calculation.rebalance_month }} 月度再平衡计划。{% if housing.enabled %}前五行比例按普通投资资金计算；国债当前金额为填入总额减去已划分的购房资金，目标金额只含基础配置与风控流入。末行单列购房资金。国债两行变动金额合并下单，佣金统一计在境内长期国债行。{% else %}比例以当前总资产为基数。{% endif %}正数增加、负数减少；佣金按 ETF 每笔万0.6、最低0.3元估算，请从现金预留。</p>
     </div>
     <span class="tag">信号日 {{ calculation.signal_date }}</span>
   </div>
@@ -84,25 +121,27 @@
     <table class="data-table result-table">
       <thead>
         <tr>
-          <th>资产</th><th>策略状态</th><th>信号价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
-          <th>当前比例</th><th>目标比例</th><th>目标金额</th><th>变动金额</th><th>佣金</th><th>动作</th>
+          <th>资产</th><th>策略状态</th>
+          <th>当前比例</th><th>目标比例</th>{% if housing.enabled %}<th>当前金额</th>{% endif %}<th>目标金额</th><th>变动金额</th><th>佣金</th><th>动作</th>
+          <th>信号价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
         </tr>
       </thead>
       <tbody>
       {% for row in calculation.rows %}
-        <tr>
+        <tr{% if row.asset == 'housing' %} class="housing-result-row"{% endif %}>
           <td><strong>{{ row.name }}</strong><span class="cell-note">{{ row.asset }}</span></td>
           <td>{{ row.signal_text }}</td>
-          <td>{{ row.market.latest|number }}</td>
-          <td>{{ row.market.lower_bound|number }}</td>
-          <td>{{ row.market.ma250|number }}</td>
-          <td>{{ row.market.upper_bound|number }}</td>
           <td>{{ row.current_weight|pct }}</td>
           <td>{{ row.target_weight|pct }}</td>
+          {% if housing.enabled %}<td>{{ row.current_value|money }}</td>{% endif %}
           <td>{{ row.target_value|money }}</td>
           <td class="{% if row.trade_value > 0.01 %}positive{% elif row.trade_value < -0.01 %}negative{% endif %}">{{ row.trade_value|signed_money }}</td>
           <td>{{ row.commission|money }}</td>
           <td>{{ row.trade_action }}</td>
+          <td>{{ row.market.latest|number }}</td>
+          <td>{{ row.market.lower_bound|number }}</td>
+          <td>{{ row.market.ma250|number }}</td>
+          <td>{{ row.market.upper_bound|number }}</td>
         </tr>
       {% endfor %}
       </tbody>
@@ -122,12 +161,16 @@
   <section class="panel">
     <div class="panel-head"><h2>正式策略</h2></div>
     <dl class="strategy-list">
-      <div><dt>基础配置</dt><dd>红利低波 30% / 纳斯达克100 50% / 黄金 10% / 境内长期国债 5% / 人民币现金 5%。</dd></div>
-      <div><dt>信号</dt><dd>每日判断：从低到高突破 MA250 上轨（+3%）恢复100%基础仓位；从高到低突破下轨（-3%）降至50%基础仓位；价格位于区间内时保持最近一次穿越后的50%或100%状态。</dd></div>
+      <div><dt>基础配置</dt><dd>{% for asset, meta in asset_meta.items() %}{{ meta.label }} {{ base_weights[asset]|pct }}{{ ' / ' if not loop.last else '。' }}{% endfor %}</dd></div>
+      <div><dt>纳指</dt><dd>不参与均线择时，始终按基础配置参与每月再平衡；每月可按目标买入或卖出。</dd></div>
+      <div><dt>红利 / 黄金</dt><dd>每日判断：从低到高突破 MA250 上轨（+3%）恢复100%基础仓位；从高到低突破下轨（-3%）降至50%基础仓位；价格位于区间内时保持最近一次穿越后的50%或100%状态。</dd></div>
       <div><dt>首次投入</dt><dd>没有历史状态时，区间内按100%基础仓位初始化，低于下轨则按50%基础仓位初始化。后续新增资金仍按当前目标比例投入，不会因为滞回区间而停留在现金。</dd></div>
-      <div><dt>执行</dt><dd>使用最新已完成交易日的信号，在下一个交易日调仓。有效数据下风险资产状态只有50%和100%两种；历史不足250日时才由长期国债临时代替。</dd></div>
-      <div><dt>释放资金</dt><dd>风险资产从满仓降至半仓时，释放其基础仓位的50%；释放资金各50%转入境内长期国债和人民币现金。基础5%国债和5%现金始终保留。</dd></div>
-      <div><dt>缺失历史</dt><dd>风险资产有效历史不足250个交易日时，其基础权重全部转入境内长期国债。</dd></div>
+      <div><dt>执行</dt><dd>每月执行一次再平衡，使用执行日前最新已完成交易日的信号。日常可计算查看最新目标；计算不会自动确认交易完成。</dd></div>
+      <div><dt>释放资金</dt><dd>红利低波或黄金从满仓降至半仓时，释放其基础仓位的50%；释放资金各50%转入境内长期国债和人民币现金。国债和现金的基础配置继续保留。</dd></div>
+      <div><dt>缺失历史</dt><dd>红利低波或黄金有效历史不足250个交易日时，其基础权重全部转入境内长期国债。纳指不因历史不足而改变目标比例。</dd></div>
+      {% if housing.enabled %}
+      <div><dt>买房专款</dt><dd>按购房进度计算累计购房资金，从总资产中扣除后，剩余资金完整执行50/30/10/5/5及风控规则。国债总目标＝普通策略国债目标＋购房资金目标；表格分两行记录，实际合并交易。</dd></div>
+      {% endif %}
       <div><dt>数据口径</dt><dd>刷新时从中证指数、Nasdaq、State Street、FRED/ECB 和上交所接口全量下载并替换本地历史；手动计算只读取最近一次成功或回退保留的本地历史。</dd></div>
     </dl>
   </section>

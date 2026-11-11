@@ -40,17 +40,17 @@ ASSET_FILES = {
 }
 
 ASSET_META = {
-    "dividend_low_vol": {
-        "label": "红利低波",
-        "source": "中证指数官方 H20269 红利低波全收益指数",
-        "source_url": f"{CSINDEX_HISTORY_URL}?indexCode=H20269&startDate=20050101",
-        "instrument": "H20269",
-    },
     "nasdaq100": {
         "label": "纳斯达克100",
         "source": "Nasdaq 官方 QQQ 日线收盘价乘美联储 H.10 USD/CNY",
         "source_url": NASDAQ_HISTORICAL_URL.format(symbol="QQQ"),
         "instrument": "QQQ",
+    },
+    "dividend_low_vol": {
+        "label": "红利低波",
+        "source": "中证指数官方 H20269 红利低波全收益指数",
+        "source_url": f"{CSINDEX_HISTORY_URL}?indexCode=H20269&startDate=20050101",
+        "instrument": "H20269",
     },
     "gold": {
         "label": "黄金",
@@ -204,7 +204,10 @@ class MarketStore:
             except (OSError, json.JSONDecodeError):
                 raw_input = {}
             if isinstance(raw_input, dict):
-                filtered_input = {key: value for key, value in raw_input.items() if key in active_assets}
+                filtered_input = {
+                    key: value for key, value in raw_input.items()
+                    if key in active_assets
+                }
                 if filtered_input != raw_input:
                     self._atomic_json(self.input_path, filtered_input)
 
@@ -214,7 +217,7 @@ class MarketStore:
             except (OSError, json.JSONDecodeError):
                 calculation = None
             rows = calculation.get("rows", []) if isinstance(calculation, dict) else []
-            if any(isinstance(row, dict) and row.get("asset") not in active_assets for row in rows):
+            if any(isinstance(row, dict) and row.get("asset") not in active_assets | {"housing"} for row in rows):
                 self.calculation_path.unlink()
 
         allowed_refresh_names = set(ASSET_FILES) | {"usd_cny", "qqq_usd", "gld_usd", "refresh_task"}
@@ -319,6 +322,8 @@ class MarketStore:
         }
         if isinstance(raw.get("base_weights"), dict):
             settings["base_weights"] = raw["base_weights"]
+        if isinstance(raw.get("housing"), dict):
+            settings["housing"] = raw["housing"]
         return settings
 
     def save_settings(self, settings: dict[str, object]) -> None:

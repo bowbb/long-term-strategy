@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Optional
 import pandas as pd
 
 from .market_data import ASSET_META, MarketStore
+from .housing import housing_transfer_plan
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -15,10 +16,9 @@ CONFIG_PATH = APP_ROOT / "strategy_config.json"
 
 RISK_ASSETS = (
     "dividend_low_vol",
-    "nasdaq100",
     "gold",
 )
-MARKET_ASSETS = RISK_ASSETS + ("long_bond",)
+MARKET_ASSETS = ("nasdaq100",) + RISK_ASSETS + ("long_bond",)
 ALL_ASSETS = MARKET_ASSETS + ("cash",)
 ETF_ASSETS = MARKET_ASSETS
 CALENDAR_ASSET = "dividend_low_vol"
@@ -54,9 +54,12 @@ def effective_base_weights(store: MarketStore | None = None) -> dict[str, float]
 
 def _as_float(value: Any) -> float:
     try:
-        return float(value)
+        amount = float(value)
     except (TypeError, ValueError):
         return 0.0
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("持仓金额必须是非负的有限数字")
+    return amount
 
 
 def _stored_strategy_multipliers(store: MarketStore) -> dict[str, float]:
@@ -280,7 +283,8 @@ def _market_snapshot(
             "observations": 0,
         }
 
-    series = series.loc[series.index <= asof]
+    if not series.empty:
+        series = series.loc[series.index <= asof]
     if series.empty:
         return {
             "asset": asset,
@@ -296,6 +300,8 @@ def _market_snapshot(
         }
 
     trend = _trend_snapshot(series, slow_days, hysteresis_band, None, sell_multiplier)
+    if asset == "nasdaq100":
+        trend.update({"ma250": None, "lower_bound": None, "upper_bound": None})
     latest_date = pd.Timestamp(series.index[-1]).normalize()
     return {
         "asset": asset,
@@ -370,6 +376,13 @@ def calculate_plan(
     base_weights = effective_base_weights(store)
     normalized_holdings = {asset: _as_float(holdings.get(asset, 0.0)) for asset in ALL_ASSETS}
     current_total = sum(normalized_holdings.values())
+    loader = getattr(store, "load_settings", None)
+    settings = loader() if callable(loader) else {}
+    housing = housing_transfer_plan(
+        settings.get("housing"), timestamp, current_total, normalized_holdings["long_bond"],
+    )
+    investment_total = housing["investment_total"]
+    current_investment_total = current_total - housing["current_reserved"]
     use_crossing_history = use_crossing_history or signal_series is not None
     if use_crossing_history:
         previous_multipliers = {asset: None for asset in RISK_ASSETS}
@@ -379,7 +392,7 @@ def calculate_plan(
                 store,
                 asset,
                 normalized_holdings[asset],
-                current_total,
+                current_investment_total,
                 base_weights[asset],
             )
             for asset in RISK_ASSETS
@@ -403,7 +416,12 @@ def calculate_plan(
     target_weights = dict(base_weights)
     released_weight = 0.0
     unavailable_weight = 0.0
-    process: list[Dict[str, Any]] = []
+    process: list[Dict[str, Any]] = [{
+        "asset": "nasdaq100", "name": _asset_label("nasdaq100"),
+        "base_weight": base_weights["nasdaq100"], "multiplier": 1.0,
+        "released_weight": 0.0, "destination": "不择时，按基础权重参与每月再平衡",
+        "action": "monthly_rebalance",
+    }]
 
     for asset in RISK_ASSETS:
         base = base_weights[asset]
@@ -457,15 +475,21 @@ def calculate_plan(
     if total_weight <= 0:
         raise RuntimeError("目标权重计算失败。")
     target_weights = {asset: weight / total_weight for asset, weight in target_weights.items()}
+    housing["bond_total_target"] = housing["target_reserved"] + investment_total * target_weights["long_bond"]
+    housing["bond_total_current"] = normalized_holdings["long_bond"]
+    housing["bond_net_trade"] = housing["bond_total_target"] - housing["bond_total_current"]
 
     rows: list[Dict[str, Any]] = []
     total_commission = 0.0
     for asset in ALL_ASSETS:
         target_weight = target_weights[asset]
-        target_value = current_total * target_weight
-        current_value = normalized_holdings[asset]
+        target_value = investment_total * target_weight
+        current_value = normalized_holdings[asset] - (
+            housing["current_reserved"] if asset == "long_bond" else 0.0
+        )
         trade_value = target_value - current_value
-        fee = _commission(abs(trade_value), commission_rate, minimum_commission) if asset in ETF_ASSETS else 0.0
+        order_value = housing["bond_net_trade"] if asset == "long_bond" else trade_value
+        fee = _commission(abs(order_value), commission_rate, minimum_commission) if asset in ETF_ASSETS else 0.0
         total_commission += fee
 
         if asset in RISK_ASSETS:
@@ -487,10 +511,17 @@ def calculate_plan(
                 "signal_basis": trend.get("signal_basis"),
             }
             signal_text = _signal_text(trend)
+        elif asset == "nasdaq100":
+            market = _market_snapshot(store, asset, signal_date, signal_series)
+            market.update({
+                "available": True, "multiplier": 1.0, "action": "monthly_rebalance",
+                "ma250": None, "lower_bound": None, "upper_bound": None,
+            })
+            signal_text = "不择时，参与每月再平衡"
         elif asset == "long_bond":
             market = _market_snapshot(store, asset, signal_date, signal_series)
             market.update({"available": True, "multiplier": None, "action": "defensive_asset"})
-            signal_text = "基础仓位 + 风险资产转入"
+            signal_text = "基础仓位 + 红利/黄金转入"
         else:
             market = {
                 "latest": 1.0,
@@ -502,15 +533,17 @@ def calculate_plan(
                 "multiplier": None,
                 "action": "cash_reserve",
             }
-            signal_text = "基础仓位 + 风险资产转入"
+            signal_text = "基础仓位 + 红利/黄金转入"
 
         rows.append(
             {
                 "asset": asset,
                 "name": _asset_label(asset),
                 "current_value": current_value,
-                "current_weight": current_value / current_total if current_total > 0 else 0.0,
+                "current_weight": current_value / current_investment_total if current_investment_total > 0 else 0.0,
                 "target_weight": target_weight,
+                "overall_target_weight": target_value / current_total if current_total > 0 else 0.0,
+                "strategy_target_value": target_value,
                 "target_value": target_value,
                 "trade_value": trade_value,
                 "trade_action": "增加" if trade_value > 0.01 else "减少" if trade_value < -0.01 else "不变",
@@ -520,11 +553,29 @@ def calculate_plan(
             }
         )
 
+    if housing["enabled"]:
+        rows.append({
+            "asset": "housing", "name": "购房资金",
+            "current_value": housing["current_reserved"],
+            "current_weight": None, "target_weight": None,
+            "overall_target_weight": housing["target_reserved"] / current_total if current_total > 0 else 0.0,
+            "target_value": housing["target_reserved"],
+            "trade_value": housing["transfer_amount"],
+            "trade_action": "增加" if housing["transfer_amount"] > 0.01 else "不变",
+            "commission": 0.0,
+            "signal_text": "按购房计划累计预留 · 长期国债",
+            "market": {"latest": None, "lower_bound": None, "ma250": None, "upper_bound": None},
+        })
+
     return {
         "calculation_date": timestamp.date().isoformat(),
         "signal_date": signal_date.date().isoformat(),
+        "stale_signal": bool(timestamp - signal_date > pd.Timedelta(days=14)),
         "execution_date": execution_date.date().isoformat() if execution_date is not None else None,
         "current_total": current_total,
+        "investment_total": investment_total,
+        "housing": housing,
+        "rebalance_month": timestamp.strftime("%Y-%m"),
         "target_weights": target_weights,
         "rows": rows,
         "process": process,
@@ -540,6 +591,8 @@ def calculate_plan(
             "commission_rate": commission_rate,
             "minimum_commission": minimum_commission,
             "base_weights": base_weights,
+            "timing_assets": list(RISK_ASSETS),
+            "rebalance_frequency": "monthly",
             "signal_data_mode": signal_data_mode,
             "signal_data_sources": dict(signal_data_sources or {}),
             "signal_state_source": "downloaded_history_crossings" if use_crossing_history else "last_calculation_state",

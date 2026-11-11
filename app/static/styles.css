@@ -68,6 +68,7 @@ h2 { font-size: 17px; }
 .summary-item strong { display: block; font-size: 19px; margin-top: 4px; }
 .result-panel { margin-top: 0; }
 .result-table { min-width: 1360px; }
+.result-table td:nth-child(2) { white-space: normal; min-width: 180px; max-width: 230px; text-align: left; }
 .compact-table { min-width: 520px; }
 .tag { background: #edf5f7; border: 1px solid #c7e1e6; border-radius: 4px; color: var(--accent-dark); font-size: 12px; padding: 4px 8px; white-space: nowrap; }
 .positive { color: var(--positive); }
@@ -121,10 +122,27 @@ h2 { font-size: 17px; }
 .status-warning, .status-partial { background: #fff5d8; color: var(--warning); }
 .status-error, .status-failed { background: #fff0ee; color: var(--danger); }
 .history-panel { margin-top: 18px; }
+.housing-panel { margin: 18px 0; border-top: 3px solid var(--accent); }
+.housing-result-row { background: #edf5f7; border-top: 2px solid #c7e1e6; }
+.housing-panel .eyebrow { margin-bottom: 7px; }
+.housing-toggle { display: flex; align-items: center; gap: 7px; font-weight: 650; margin-bottom: 16px; }
+.housing-toggle input { accent-color: var(--accent); width: 17px; height: 17px; }
+.housing-fields { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(240px, 1.3fr); gap: 18px; }
+.housing-fields label { display: flex; flex-direction: column; gap: 7px; justify-content: end; }
+.housing-fields small { color: var(--muted); font-weight: 400; }
+.housing-fields input { border: 1px solid #c8d1d9; border-radius: 4px; padding: 9px 11px; min-height: 42px; font: inherit; width: 100%; }
+.housing-fields input:focus { border-color: var(--accent); outline: 2px solid #c5e2e9; }
+.housing-preview { background: #edf5f7; border-radius: 4px; padding: 13px 15px; margin: 16px 0 0; color: var(--accent-dark); }
+.housing-schedule { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }
+.housing-schedule summary { cursor: pointer; color: var(--accent-dark); margin-bottom: 10px; }
+.housing-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 15px; }
+.housing-stats span { display: block; color: var(--muted); font-size: 12px; }
+.housing-stats strong { display: block; font-size: 20px; margin-top: 5px; }
 
 @media (max-width: 900px) {
   .workspace-grid, .detail-grid, .settings-grid { grid-template-columns: 1fr; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .housing-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 600px) {
   .topbar-inner { padding: 0 15px; }
@@ -141,4 +159,6 @@ h2 { font-size: 17px; }
   .summary-item { padding: 11px; }
   .summary-item strong { font-size: 16px; }
   .nav-link { padding: 0 8px; }
+  .housing-fields { grid-template-columns: 1fr; }
+  .housing-form .allocation-actions { align-items: start; flex-direction: column; }
 }
