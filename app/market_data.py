@@ -324,6 +324,8 @@ class MarketStore:
             settings["base_weights"] = raw["base_weights"]
         if isinstance(raw.get("housing"), dict):
             settings["housing"] = raw["housing"]
+        if isinstance(raw.get("drawdown_multipliers"), dict):
+            settings["drawdown_multipliers"] = raw["drawdown_multipliers"]
         return settings
 
     def save_settings(self, settings: dict[str, object]) -> None:

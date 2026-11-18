@@ -45,6 +45,39 @@
 })();
 
 (() => {
+  const form = document.querySelector("[data-drawdown-form]");
+  if (!form) return;
+  const inputs = [...form.querySelectorAll("[data-drawdown-input]")];
+  const defaults = {nasdaq100: 100, dividend_low_vol: 50, gold: 0};
+  const validation = form.querySelector("[data-drawdown-validation]");
+  const submit = form.querySelector("[data-drawdown-submit]");
+  const update = () => {
+    const valid = inputs.every((input) => input.validity.valid);
+    validation.textContent = valid ? "每项可设0%–100%，无需合计100%" : "请将每项比例填写为0%到100%之间的数字";
+    validation.classList.toggle("is-invalid", !valid);
+    submit.disabled = !valid;
+    inputs.forEach((input) => {
+      const description = form.querySelector(`[data-drawdown-description="${input.dataset.drawdownInput}"]`);
+      if (!input.validity.valid) {
+        description.textContent = "请输入有效的回撤持仓比例";
+        return;
+      }
+      const value = Number(input.value);
+      const target = (Number(input.dataset.baseWeight) * value).toFixed(1);
+      description.textContent = input.dataset.drawdownInput === "nasdaq100" && value === 100
+        ? `不择时，始终保持基础配置 ${(Number(input.dataset.baseWeight) * 100).toFixed(1)}%`
+        : `回撤时目标占投资资金 ${target}%（基础权重 × ${value}%）`;
+    });
+  };
+  inputs.forEach((input) => input.addEventListener("input", update));
+  form.querySelector("[data-drawdown-reset]").addEventListener("click", () => {
+    inputs.forEach((input) => { input.value = defaults[input.dataset.drawdownInput]; });
+    update();
+  });
+  update();
+})();
+
+(() => {
   const form = document.querySelector("[data-housing-form]");
   if (!form) return;
   const enabled = form.querySelector("[data-housing-enabled]");

@@ -18,6 +18,8 @@ RISK_ASSETS = (
     "dividend_low_vol",
     "gold",
 )
+DRAWDOWN_ASSETS = ("nasdaq100",) + RISK_ASSETS
+DEFAULT_DRAWDOWN_MULTIPLIERS = {"nasdaq100": 1.0, "dividend_low_vol": 0.5, "gold": 0.0}
 MARKET_ASSETS = ("nasdaq100",) + RISK_ASSETS + ("long_bond",)
 ALL_ASSETS = MARKET_ASSETS + ("cash",)
 ETF_ASSETS = MARKET_ASSETS
@@ -52,6 +54,24 @@ def effective_base_weights(store: MarketStore | None = None) -> dict[str, float]
     return weights
 
 
+def effective_drawdown_multipliers(store: MarketStore | None = None) -> dict[str, float]:
+    multipliers = dict(DEFAULT_DRAWDOWN_MULTIPLIERS)
+    loader = getattr(store, "load_settings", None)
+    if not callable(loader):
+        return multipliers
+    configured = loader().get("drawdown_multipliers", {})
+    if not isinstance(configured, dict):
+        return multipliers
+    for asset in DRAWDOWN_ASSETS:
+        try:
+            value = float(configured[asset])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
+            multipliers[asset] = value
+    return multipliers
+
+
 def _as_float(value: Any) -> float:
     try:
         amount = float(value)
@@ -74,7 +94,7 @@ def _stored_strategy_multipliers(store: MarketStore) -> dict[str, float]:
     rows = calculation.get("rows", []) if isinstance(calculation, dict) else []
     stored: dict[str, float] = {}
     for row in rows:
-        if not isinstance(row, dict) or row.get("asset") not in RISK_ASSETS:
+        if not isinstance(row, dict) or row.get("asset") not in DRAWDOWN_ASSETS:
             continue
         market = row.get("market")
         multiplier = market.get("multiplier") if isinstance(market, dict) else None
@@ -82,7 +102,7 @@ def _stored_strategy_multipliers(store: MarketStore) -> dict[str, float]:
             value = float(multiplier)
         except (TypeError, ValueError):
             continue
-        if value in {0.5, 1.0}:
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
             stored[str(row["asset"])] = value
     return stored
 
@@ -93,17 +113,18 @@ def _previous_multiplier(
     holding: float,
     current_total: float,
     base_weight: float,
+    sell_multiplier: float = 0.5,
 ) -> float:
     """Infer the current sleeve state; a new sleeve starts at its base weight."""
     stored = _stored_strategy_multipliers(store).get(asset)
-    if stored in {0.5, 1.0}:
-        return stored
+    if stored is not None:
+        return 1.0 if stored == 1.0 else sell_multiplier
 
     if holding <= 0.01 or current_total <= 0.0:
         return 1.0
 
     current_weight = holding / current_total
-    return 1.0 if current_weight >= base_weight * 0.75 else 0.5
+    return 1.0 if current_weight >= base_weight * (1.0 + sell_multiplier) / 2 else sell_multiplier
 
 
 def _series_from_source(
@@ -203,7 +224,7 @@ def _trend_snapshot(
         elif latest < lower_bound:
             multiplier = sell_multiplier
             action = "switch_to_half"
-        elif previous_multiplier not in {0.5, 1.0}:
+        elif previous_multiplier not in {sell_multiplier, 1.0}:
             multiplier = 1.0
             action = "initialize_from_base"
         else:
@@ -266,7 +287,7 @@ def _market_snapshot(
     config = load_config()
     slow_days = int(config["slow_ma_days"])
     hysteresis_band = float(config["hysteresis_band"])
-    sell_multiplier = float(config.get("sell_signal_multiplier", 0.5))
+    sell_multiplier = effective_drawdown_multipliers(store).get(asset, 0.5)
     try:
         series = _series_from_source(store, asset, series_source).sort_index()
     except Exception as exc:
@@ -300,8 +321,6 @@ def _market_snapshot(
         }
 
     trend = _trend_snapshot(series, slow_days, hysteresis_band, None, sell_multiplier)
-    if asset == "nasdaq100":
-        trend.update({"ma250": None, "lower_bound": None, "upper_bound": None})
     latest_date = pd.Timestamp(series.index[-1]).normalize()
     return {
         "asset": asset,
@@ -338,20 +357,19 @@ def _signal_text(trend: Mapping[str, Any]) -> str:
     if action == "switch_on":
         return "从低到高突破上轨，恢复基础仓位" if direct_history else "突破上轨，恢复基础仓位"
     if action == "switch_to_half":
-        return "从高到低突破下轨，降至基础仓位50%" if direct_history else "跌破下轨，降至基础仓位50%"
+        return "从高到低突破下轨，按回撤设置调整持仓" if direct_history else "跌破下轨，按回撤设置调整持仓"
     if action == "hold_previous":
         if direct_history:
-            state = "半仓" if float(trend.get("multiplier") or 0.0) < 1.0 else "满仓"
-            return f"滞回区间内，保持上次信号后的{state}状态"
+            return "滞回区间内，保持上次信号后的持仓状态"
         return "滞回区间内，保持当前状态"
     if action == "hold_above_upper":
         return "上轨上方，保持上次突破后的满仓状态"
     if action == "hold_below_lower":
-        return "下轨下方，保持上次跌破后的半仓状态"
+        return "下轨下方，保持上次跌破后的持仓状态"
     if action == "initialize_from_base":
         return "首次无历史状态，按基础仓位初始化"
     if action == "initialize_from_lower":
-        return "首次状态已低于下轨，按基础仓位50%初始化"
+        return "首次状态已低于下轨，按回撤设置初始化"
     return "历史不足250日"
 
 
@@ -368,7 +386,11 @@ def calculate_plan(
     timestamp = pd.Timestamp(asof).normalize()
     slow_days = int(config["slow_ma_days"])
     hysteresis_band = float(config["hysteresis_band"])
-    sell_multiplier = float(config.get("sell_signal_multiplier", 0.5))
+    drawdown_multipliers = effective_drawdown_multipliers(store)
+    timing_assets = tuple(
+        asset for asset in DRAWDOWN_ASSETS
+        if asset != "nasdaq100" or drawdown_multipliers[asset] < 1.0
+    )
     release_to_cash = float(config["released_to_cash_ratio"])
     release_to_bond = 1.0 - release_to_cash
     commission_rate = float(config["commission_rate"])
@@ -385,7 +407,7 @@ def calculate_plan(
     current_investment_total = current_total - housing["current_reserved"]
     use_crossing_history = use_crossing_history or signal_series is not None
     if use_crossing_history:
-        previous_multipliers = {asset: None for asset in RISK_ASSETS}
+        previous_multipliers = {asset: None for asset in timing_assets}
     else:
         previous_multipliers = {
             asset: _previous_multiplier(
@@ -394,8 +416,9 @@ def calculate_plan(
                 normalized_holdings[asset],
                 current_investment_total,
                 base_weights[asset],
+                drawdown_multipliers[asset],
             )
-            for asset in RISK_ASSETS
+            for asset in timing_assets
         }
 
     signal_date, execution_date = _signal_context(store, timestamp, signal_series)
@@ -407,23 +430,23 @@ def calculate_plan(
             slow_days=slow_days,
             hysteresis_band=hysteresis_band,
             previous_multiplier=previous_multipliers[asset],
-            sell_multiplier=sell_multiplier,
+            sell_multiplier=drawdown_multipliers[asset],
             use_crossing_history=use_crossing_history,
         )
-        for asset in RISK_ASSETS
+        for asset in timing_assets
     }
 
     target_weights = dict(base_weights)
     released_weight = 0.0
     unavailable_weight = 0.0
-    process: list[Dict[str, Any]] = [{
+    process: list[Dict[str, Any]] = [] if "nasdaq100" in timing_assets else [{
         "asset": "nasdaq100", "name": _asset_label("nasdaq100"),
         "base_weight": base_weights["nasdaq100"], "multiplier": 1.0,
         "released_weight": 0.0, "destination": "不择时，按基础权重参与每月再平衡",
         "action": "monthly_rebalance",
     }]
 
-    for asset in RISK_ASSETS:
+    for asset in timing_assets:
         base = base_weights[asset]
         trend = final_snapshots[asset]
         if not trend["available"]:
@@ -452,11 +475,9 @@ def calculate_plan(
         released_weight += released
         if multiplier == 1.0:
             destination = "不释放资金，保持基础仓位"
-        elif multiplier == sell_multiplier:
-            released_ratio = 1.0 - sell_multiplier
-            destination = f"释放基础仓位的{released_ratio:.0%}，其中各50%转入境内长期国债和人民币现金"
         else:
-            destination = "按基础仓位初始化"
+            released_ratio = 1.0 - multiplier
+            destination = f"释放基础仓位的{released_ratio:.1%}，其中{release_to_bond:.0%}转入境内长期国债、{release_to_cash:.0%}转入人民币现金"
         process.append(
             {
                 "asset": asset,
@@ -492,7 +513,7 @@ def calculate_plan(
         fee = _commission(abs(order_value), commission_rate, minimum_commission) if asset in ETF_ASSETS else 0.0
         total_commission += fee
 
-        if asset in RISK_ASSETS:
+        if asset in timing_assets:
             trend = final_snapshots[asset]
             market = {
                 "latest": trend["latest"],
@@ -521,7 +542,7 @@ def calculate_plan(
         elif asset == "long_bond":
             market = _market_snapshot(store, asset, signal_date, signal_series)
             market.update({"available": True, "multiplier": None, "action": "defensive_asset"})
-            signal_text = "基础仓位 + 红利/黄金转入"
+            signal_text = "基础仓位 + 风控释放转入" if "nasdaq100" in timing_assets else "基础仓位 + 红利/黄金转入"
         else:
             market = {
                 "latest": 1.0,
@@ -533,7 +554,7 @@ def calculate_plan(
                 "multiplier": None,
                 "action": "cash_reserve",
             }
-            signal_text = "基础仓位 + 红利/黄金转入"
+            signal_text = "基础仓位 + 风控释放转入" if "nasdaq100" in timing_assets else "基础仓位 + 红利/黄金转入"
 
         rows.append(
             {
@@ -585,13 +606,14 @@ def calculate_plan(
         "strategy": {
             "slow_ma_days": slow_days,
             "hysteresis_band": hysteresis_band,
-            "sell_signal_multiplier": sell_multiplier,
+            "sell_signal_multiplier": drawdown_multipliers["dividend_low_vol"],
+            "drawdown_multipliers": drawdown_multipliers,
             "released_to_cash_ratio": release_to_cash,
             "released_to_bond_ratio": release_to_bond,
             "commission_rate": commission_rate,
             "minimum_commission": minimum_commission,
             "base_weights": base_weights,
-            "timing_assets": list(RISK_ASSETS),
+            "timing_assets": list(timing_assets),
             "rebalance_frequency": "monthly",
             "signal_data_mode": signal_data_mode,
             "signal_data_sources": dict(signal_data_sources or {}),

@@ -186,16 +186,20 @@ class MarketDataTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             store.merge_and_write("demo", pd.Series([1.0, 1.01], index=dates))
 
-    def test_market_overview_excludes_manual_cash(self):
+    def test_market_overview_excludes_manual_cash_and_shows_nasdaq_indicators(self):
         store = MemoryStore()
-        dates = pd.date_range("2030-01-02", periods=2, freq="D")
+        dates = pd.date_range("2030-01-02", periods=250, freq="D")
         for asset in ("dividend_low_vol", "nasdaq100", "gold", "long_bond"):
-            store.write_series(asset, pd.Series([100.0, 101.0], index=dates))
+            store.write_series(asset, pd.Series(100.0, index=dates))
 
         overview = build_market_overview(store, dates[-1])
 
         self.assertEqual(len(overview), 4)
         self.assertNotIn("cash", {item["asset"] for item in overview})
+        nasdaq = next(item for item in overview if item["asset"] == "nasdaq100")
+        self.assertAlmostEqual(nasdaq["ma250"], 100.0)
+        self.assertAlmostEqual(nasdaq["lower_bound"], 97.0)
+        self.assertAlmostEqual(nasdaq["upper_bound"], 103.0)
 
 
 if __name__ == "__main__":

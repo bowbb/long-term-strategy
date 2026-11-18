@@ -91,9 +91,9 @@ class HousingTests(unittest.TestCase):
         self.assertEqual(plan["rows"][0]["asset"], "nasdaq100")
         self.assertEqual(plan["target_weights"]["nasdaq100"], 0.5)
         self.assertAlmostEqual(plan["target_weights"]["dividend_low_vol"], 0.15)
-        self.assertAlmostEqual(plan["target_weights"]["gold"], 0.05)
-        self.assertAlmostEqual(plan["target_weights"]["long_bond"], 0.15)
-        self.assertAlmostEqual(plan["target_weights"]["cash"], 0.15)
+        self.assertAlmostEqual(plan["target_weights"]["gold"], 0.0)
+        self.assertAlmostEqual(plan["target_weights"]["long_bond"], 0.175)
+        self.assertAlmostEqual(plan["target_weights"]["cash"], 0.175)
         self.assertEqual(plan["rows"][0]["market"]["action"], "monthly_rebalance")
         self.assertEqual(plan["strategy"]["rebalance_frequency"], "monthly")
 
@@ -162,7 +162,7 @@ class HousingTests(unittest.TestCase):
         store.series["gold"].iloc[-1] = 96
         plan = calculate_plan(store, {"cash": 100000}, "2026-11-11", use_crossing_history=True)
         bond = next(row for row in plan["rows"] if row["asset"] == "long_bond")
-        self.assertAlmostEqual(bond["target_value"], 15000)
+        self.assertAlmostEqual(bond["target_value"], 17500)
         self.assertEqual(plan["housing"]["target_reserved"], 0)
         executed = {row["asset"]: row["target_value"] for row in plan["rows"] if row["asset"] in ALL_ASSETS}
         again = calculate_plan(store, executed, "2026-11-11", use_crossing_history=True)
@@ -176,13 +176,13 @@ class HousingTests(unittest.TestCase):
         rows = {row["asset"]: row for row in plan["rows"]}
         self.assertEqual(rows["nasdaq100"]["target_weight"], 0.5)
         self.assertAlmostEqual(rows["nasdaq100"]["target_value"], 70000)
-        self.assertAlmostEqual(rows["long_bond"]["target_weight"], 0.15)
-        self.assertAlmostEqual(rows["long_bond"]["target_value"], 21000)
+        self.assertAlmostEqual(rows["long_bond"]["target_weight"], 0.175)
+        self.assertAlmostEqual(rows["long_bond"]["target_value"], 24500)
         self.assertEqual(rows["housing"]["target_value"], 60000)
-        self.assertAlmostEqual(plan["housing"]["bond_total_target"], 81000)
+        self.assertAlmostEqual(plan["housing"]["bond_total_target"], 84500)
         self.assertAlmostEqual(sum(row["target_value"] for row in plan["rows"]), 200000)
         self.assertAlmostEqual(sum(row["trade_value"] for row in plan["rows"]), 0)
-        self.assertAlmostEqual(rows["long_bond"]["commission"], 81000 * 0.00006)
+        self.assertAlmostEqual(rows["long_bond"]["commission"], 84500 * 0.00006)
         self.assertEqual(rows["housing"]["commission"], 0)
         self.assertAlmostEqual(plan["estimated_commission"], sum(row["commission"] for row in plan["rows"]))
 
@@ -202,11 +202,16 @@ class HousingTests(unittest.TestCase):
         try:
             store = MarketStore(folder)
             store.ensure_store()
-            store.save_settings({"refresh_time": "06:30", "timezone": "Asia/Shanghai", "housing": self.config})
+            drawdown = {"nasdaq100": 0.75, "dividend_low_vol": 0.25, "gold": 0.0}
+            store.save_settings({
+                "refresh_time": "06:30", "timezone": "Asia/Shanghai",
+                "housing": self.config, "drawdown_multipliers": drawdown,
+            })
             store.save_portfolio_input({"long_bond": 70000, "housing_reserved": 60000})
             store.save_calculation({"rows": [{"asset": "housing"}]})
             reloaded = MarketStore(folder)
             self.assertEqual(reloaded.load_settings()["housing"], self.config)
+            self.assertEqual(reloaded.load_settings()["drawdown_multipliers"], drawdown)
             self.assertNotIn("housing_reserved", reloaded.load_portfolio_input())
             self.assertEqual(reloaded.load_portfolio_input()["long_bond"], 70000)
             self.assertIsNotNone(reloaded.load_calculation())

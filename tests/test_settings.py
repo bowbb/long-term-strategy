@@ -55,6 +55,7 @@ class SettingsRoutesTests(unittest.TestCase):
     def test_refresh_time_update_preserves_saved_allocation(self):
         current = {
             **self.current,
+            "drawdown_multipliers": {"nasdaq100": 0.8, "dividend_low_vol": 0.3, "gold": 0.0},
             "base_weights": {
                 "dividend_low_vol": 0.25,
                 "nasdaq100": 0.45,
@@ -73,6 +74,66 @@ class SettingsRoutesTests(unittest.TestCase):
         saved = save_settings.call_args.args[0]
         self.assertEqual(saved["refresh_time"], "08:45")
         self.assertEqual(saved["base_weights"], current["base_weights"])
+        self.assertEqual(saved["drawdown_multipliers"], current["drawdown_multipliers"])
+
+    def test_drawdown_saves_independent_percentages_and_preserves_other_settings(self):
+        current = {**self.current, "base_weights": {"nasdaq100": 0.5},
+                   "housing": {"enabled": True, "purchase_month": "2028-06", "target_amount": 1000}}
+        with (
+            patch.object(main.store, "load_settings", return_value=current),
+            patch.object(main.store, "save_settings") as save,
+        ):
+            response = self.client.post("/settings/drawdown", data={
+                "drawdown_nasdaq100": "80", "drawdown_dividend_low_vol": "35.5", "drawdown_gold": "0",
+            })
+        self.assertEqual(response.status_code, 302)
+        saved = save.call_args.args[0]
+        self.assertEqual(saved["drawdown_multipliers"],
+                         {"nasdaq100": 0.8, "dividend_low_vol": 0.355, "gold": 0.0})
+        self.assertEqual(saved["housing"], current["housing"])
+        self.assertEqual(saved["base_weights"], current["base_weights"])
+
+    def test_invalid_drawdown_does_not_save_partial_values(self):
+        for bad in ("", "-1", "100.1", "nan", "inf", "abc"):
+            with self.subTest(value=bad), patch.object(main.store, "save_settings") as save:
+                self.client.post("/settings/drawdown", data={
+                    "drawdown_nasdaq100": "100", "drawdown_dividend_low_vol": "50",
+                    "drawdown_gold": bad,
+                })
+                save.assert_not_called()
+
+    def test_home_explanations_and_settings_follow_custom_drawdown(self):
+        current = {**self.current, "drawdown_multipliers": {
+            "nasdaq100": 0.6, "dividend_low_vol": 0.3, "gold": 0.1,
+        }}
+        series = pd.Series(100.0, index=pd.bdate_range("2024-01-01", "2026-11-10"))
+        series.iloc[-1] = 96.0
+        with patch.object(main, "store") as store:
+            store.load_settings.return_value = current
+            store.load_portfolio_input.return_value = {"cash": 100000}
+            store.read_series.return_value = series
+            home = self.client.get("/").get_data(as_text=True)
+            settings = self.client.get("/settings").get_data(as_text=True)
+        self.assertIn("每日收盘数据更新信号；月度执行时按最新目标再平衡。", home)
+        self.assertNotIn("纳指行情仅供参考", home)
+        self.assertIn("<dt>纳指</dt><dd>跌破 MA250 下轨（-3%）后保留60%基础仓位", home)
+        self.assertIn("<dt>红利低波</dt><dd>跌破 MA250 下轨（-3%）后保留30%基础仓位", home)
+        self.assertIn("<dt>黄金</dt><dd>跌破 MA250 下轨（-3%）后保留10%基础仓位", home)
+        self.assertNotIn("纳指不择时", home)
+        self.assertNotIn("降至50%基础仓位", home)
+        self.assertIn('value="60.0"', settings)
+        self.assertIn('value="30.0"', settings)
+        self.assertIn('value="10.0"', settings)
+
+    def test_home_omits_drawdown_settings_before_first_calculation(self):
+        with patch.object(main, "store") as store:
+            store.load_settings.return_value = self.current
+            store.load_portfolio_input.return_value = {}
+            store.read_series.return_value = pd.Series(dtype=float)
+            home = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn("回撤持仓设置", home)
+        self.assertNotIn("纳指不择时", home)
+        self.assertIn("每月按目标再平衡。", home)
 
     def test_housing_settings_are_validated_and_preserve_allocation(self):
         current = {**self.current, "base_weights": {"nasdaq100": 0.5}}

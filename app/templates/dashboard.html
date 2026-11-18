@@ -3,9 +3,9 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <div class="eyebrow">纳指固定配置 · 红利 / 黄金 MA250 ±3%</div>
+    <div class="eyebrow">{% if drawdown_multipliers.nasdaq100 == 1 %}纳指固定配置 · 红利 / 黄金{% else %}纳指 / 红利 / 黄金{% endif %} MA250 ±3%</div>
     <h1>本次投资计划</h1>
-    <p class="muted">计算日 {{ today }}。每月按目标再平衡，纳指不择时。信号使用本地已刷新历史{% if housing.enabled %}；购房资金按进度单列，剩余资金照常按基础比例与风控规则分配{% endif %}。</p>
+    <p class="muted">计算日 {{ today }}。每月按目标再平衡。信号使用本地已刷新历史{% if housing.enabled %}；购房资金按进度单列，剩余资金照常按基础比例与风控规则分配{% endif %}。</p>
   </div>
   <a class="button button-secondary" href="{{ url_for('settings') }}">刷新数据</a>
 </section>
@@ -14,7 +14,7 @@
   <div class="notice notice-error">{{ error }}</div>
 {% endif %}
 
-<section class="workspace-grid">
+<section class="holdings-section">
   <form class="panel" method="post" action="{{ url_for('calculate') }}">
     <div class="panel-head">
       <div>
@@ -42,28 +42,6 @@
     {% endif %}
   </form>
 
-  <section class="panel">
-    <div class="panel-head">
-      <div><h2>最新数据概览</h2><p class="muted">每日收盘数据更新信号；月度执行时按最新目标再平衡。纳指行情仅供参考，不参与均线择时。</p></div>
-    </div>
-    <div class="table-scroll">
-      <table class="data-table compact-table">
-        <thead><tr><th>资产</th><th>数据日</th><th>最新价</th><th>MA250下轨</th><th>MA250</th><th>MA250上轨</th></tr></thead>
-        <tbody>
-        {% for item in overview if item.asset != 'cash' %}
-          <tr>
-            <td>{{ item.name }}</td>
-            <td>{{ item.latest_date or '-' }}</td>
-            <td>{{ item.latest|number }}</td>
-            <td>{{ item.lower_bound|number }}</td>
-            <td>{{ item.ma250|number }}</td>
-            <td>{{ item.upper_bound|number }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
 </section>
 
 {% if housing.enabled %}
@@ -123,7 +101,6 @@
         <tr>
           <th>资产</th><th>策略状态</th>
           <th>当前比例</th><th>目标比例</th>{% if housing.enabled %}<th>当前金额</th>{% endif %}<th>目标金额</th><th>变动金额</th><th>佣金</th><th>动作</th>
-          <th>信号价格</th><th>下轨</th><th>MA250</th><th>上轨</th>
         </tr>
       </thead>
       <tbody>
@@ -138,10 +115,30 @@
           <td class="{% if row.trade_value > 0.01 %}positive{% elif row.trade_value < -0.01 %}negative{% endif %}">{{ row.trade_value|signed_money }}</td>
           <td>{{ row.commission|money }}</td>
           <td>{{ row.trade_action }}</td>
-          <td>{{ row.market.latest|number }}</td>
-          <td>{{ row.market.lower_bound|number }}</td>
-          <td>{{ row.market.ma250|number }}</td>
-          <td>{{ row.market.upper_bound|number }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="panel market-overview-panel">
+  <div class="panel-head">
+    <div><h2>最新数据概览</h2><p class="muted">每日收盘数据更新信号；月度执行时按最新目标再平衡。</p></div>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table compact-table">
+      <thead><tr><th>资产</th><th>数据日</th><th>最新价</th><th>MA250下轨</th><th>MA250</th><th>MA250上轨</th></tr></thead>
+      <tbody>
+      {% for item in overview if item.asset != 'cash' %}
+        <tr>
+          <td>{{ item.name }}</td>
+          <td>{{ item.latest_date or '-' }}</td>
+          <td>{{ item.latest|number }}</td>
+          <td>{{ item.lower_bound|number }}</td>
+          <td>{{ item.ma250|number }}</td>
+          <td>{{ item.upper_bound|number }}</td>
         </tr>
       {% endfor %}
       </tbody>
@@ -149,6 +146,7 @@
   </div>
 </section>
 
+{% if calculation %}
 <section class="detail-grid">
   <section class="panel">
     <div class="panel-head"><h2>计算过程</h2></div>
@@ -162,12 +160,12 @@
     <div class="panel-head"><h2>正式策略</h2></div>
     <dl class="strategy-list">
       <div><dt>基础配置</dt><dd>{% for asset, meta in asset_meta.items() %}{{ meta.label }} {{ base_weights[asset]|pct }}{{ ' / ' if not loop.last else '。' }}{% endfor %}</dd></div>
-      <div><dt>纳指</dt><dd>不参与均线择时，始终按基础配置参与每月再平衡；每月可按目标买入或卖出。</dd></div>
-      <div><dt>红利 / 黄金</dt><dd>每日判断：从低到高突破 MA250 上轨（+3%）恢复100%基础仓位；从高到低突破下轨（-3%）降至50%基础仓位；价格位于区间内时保持最近一次穿越后的50%或100%状态。</dd></div>
-      <div><dt>首次投入</dt><dd>没有历史状态时，区间内按100%基础仓位初始化，低于下轨则按50%基础仓位初始化。后续新增资金仍按当前目标比例投入，不会因为滞回区间而停留在现金。</dd></div>
+      {% for asset, label in [('nasdaq100', '纳指'), ('dividend_low_vol', '红利低波'), ('gold', '黄金')] %}
+      <div><dt>{{ label }}</dt><dd>{% if drawdown_multipliers[asset] == 1 %}不择时，按基础配置参与每月再平衡。{% else %}跌破 MA250 下轨（-3%）后保留{{ '%g'|format(drawdown_multipliers[asset] * 100) }}%基础仓位；突破上轨（+3%）恢复100%，区间内保持最近一次信号状态。{% endif %}</dd></div>
+      {% endfor %}
+      <div><dt>首次投入</dt><dd>没有历史状态时，区间内按100%基础仓位初始化，低于下轨则按各资产已保存的回撤持仓比例初始化。后续新增资金按当前目标比例分配。</dd></div>
       <div><dt>执行</dt><dd>每月执行一次再平衡，使用执行日前最新已完成交易日的信号。日常可计算查看最新目标；计算不会自动确认交易完成。</dd></div>
-      <div><dt>释放资金</dt><dd>红利低波或黄金从满仓降至半仓时，释放其基础仓位的50%；释放资金各50%转入境内长期国债和人民币现金。国债和现金的基础配置继续保留。</dd></div>
-      <div><dt>缺失历史</dt><dd>红利低波或黄金有效历史不足250个交易日时，其基础权重全部转入境内长期国债。纳指不因历史不足而改变目标比例。</dd></div>
+      <div><dt>释放资金</dt><dd>触发回撤信号时，释放该资产基础仓位中未保留的部分，释放资金各50%转入境内长期国债和人民币现金。国债和现金的基础配置继续保留。</dd></div>
       {% if housing.enabled %}
       <div><dt>买房专款</dt><dd>按购房进度计算累计购房资金，从总资产中扣除后，剩余资金完整执行50/30/10/5/5及风控规则。国债总目标＝普通策略国债目标＋购房资金目标；表格分两行记录，实际合并交易。</dd></div>
       {% endif %}

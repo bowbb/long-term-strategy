@@ -13,7 +13,7 @@
   <div class="panel-head allocation-head">
     <div>
       <h2>投资比例</h2>
-      <p class="muted">纳指不择时，参与每月再平衡；红利低波与黄金采用 MA250 ±3% 滞回，跌破下轨降至半仓。</p>
+      <p class="muted">设置各类资产的基础权重，合计为100%。跌破 MA250 下轨后的持仓比例在下方单独设置。</p>
     </div>
     <div class="allocation-total" data-allocation-total-wrap>
       <span>合计</span>
@@ -46,6 +46,42 @@
     <div class="allocation-actions">
       <span class="allocation-validation" data-allocation-validation aria-live="polite">比例合计正确</span>
       <button class="button button-primary" type="submit" data-allocation-submit>保存比例</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel drawdown-panel" id="drawdown">
+  <div class="panel-head">
+    <div>
+      <div class="eyebrow">MA250 ±3% · 回撤控制</div>
+      <h2>回撤时保留的持仓比例</h2>
+      <p class="muted">从高到低跌破 MA250 下轨（-3%）后，保留该资产基础仓位的指定比例；突破上轨（+3%）恢复100%，区间内保持最近一次信号状态。</p>
+    </div>
+    <span class="tag">三项独立设置</span>
+  </div>
+  <form method="post" action="{{ url_for('save_drawdown') }}" data-drawdown-form>
+    <div class="drawdown-grid">
+      {% for asset in ['nasdaq100', 'dividend_low_vol', 'gold'] %}
+      <div class="drawdown-card">
+        <label class="allocation-asset" for="drawdown_{{ asset }}">
+          <span class="asset-swatch asset-{{ asset }}" aria-hidden="true"></span>
+          <strong>{{ asset_meta[asset].label }}</strong>
+        </label>
+        <div class="percent-input">
+          <input id="drawdown_{{ asset }}" name="drawdown_{{ asset }}" type="number" min="0" max="100" step="0.1" value="{{ '%.1f'|format(drawdown_multipliers[asset] * 100) }}" inputmode="decimal" data-drawdown-input="{{ asset }}" data-base-weight="{{ base_weights[asset] }}" required>
+          <span>%</span>
+        </div>
+        <p class="muted" data-drawdown-description="{{ asset }}"></p>
+      </div>
+      {% endfor %}
+    </div>
+    <p class="drawdown-help">100%：保持基础仓位；50%：保留一半；0%：清仓。释放的资金各50%转入长期国债和现金。纳指设为100%时保持不择时。</p>
+    <div class="allocation-actions">
+      <span class="allocation-validation" data-drawdown-validation aria-live="polite">每项可设0%–100%，无需合计100%</span>
+      <div class="drawdown-buttons">
+        <button class="button button-secondary" type="button" data-drawdown-reset>恢复默认 100 / 50 / 0</button>
+        <button class="button button-primary" type="submit" data-drawdown-submit>保存回撤比例</button>
+      </div>
     </div>
   </form>
 </section>

@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, flash, redirect, render_template, request, url_for
 
 from .market_data import ASSET_META, MarketStore, refresh_all
-from .strategy_engine import ALL_ASSETS, build_market_overview, calculate_plan, effective_base_weights
+from .strategy_engine import (
+    ALL_ASSETS, DRAWDOWN_ASSETS, build_market_overview, calculate_plan,
+    effective_base_weights, effective_drawdown_multipliers,
+)
 from .housing import housing_schedule, validate_housing
 
 
@@ -197,6 +200,7 @@ def _dashboard(calculation=None, values=None, error=None, signal_series=None):
         error=error,
         asset_meta=ASSET_META,
         base_weights=effective_base_weights(store),
+        drawdown_multipliers=effective_drawdown_multipliers(store),
         housing=housing_schedule(store.load_settings().get("housing"), today),
     )
 
@@ -241,6 +245,7 @@ def settings():
         logs=logs,
         asset_meta=ASSET_META,
         base_weights=effective_base_weights(store),
+        drawdown_multipliers=effective_drawdown_multipliers(store),
         housing=housing_schedule(current.get("housing"), _today()),
     )
 
@@ -299,6 +304,29 @@ def save_housing():
         "success",
     )
     return redirect(url_for("settings"))
+
+
+@app.post("/settings/drawdown")
+def save_drawdown():
+    multipliers = {}
+    try:
+        for asset in DRAWDOWN_ASSETS:
+            raw = str(request.form.get(f"drawdown_{asset}", "")).strip()
+            try:
+                value = float(raw)
+            except ValueError as exc:
+                raise ValueError(f"{ASSET_META[asset]['label']} 的回撤持仓比例不是有效数字") from exc
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise ValueError(f"{ASSET_META[asset]['label']} 的回撤持仓比例必须在 0% 到 100% 之间")
+            multipliers[asset] = value / 100
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("settings") + "#drawdown")
+    current = store.load_settings()
+    current["drawdown_multipliers"] = multipliers
+    store.save_settings(current)
+    flash("回撤持仓比例已保存，首页说明和目标仓位计算已同步更新。", "success")
+    return redirect(url_for("settings") + "#drawdown")
 
 
 @app.post("/refresh")

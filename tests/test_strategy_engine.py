@@ -11,13 +11,18 @@ from app.strategy_engine import (
     _signal_text,
     _trend_snapshot,
     calculate_plan,
+    effective_drawdown_multipliers,
 )
 
 
 class MemoryStore:
-    def __init__(self, series: dict[str, pd.Series], calculation=None):
+    def __init__(self, series: dict[str, pd.Series], calculation=None, settings=None):
         self.series = series
         self.calculation = calculation
+        self.settings = settings or {}
+
+    def load_settings(self):
+        return self.settings
 
     def read_series(self, name: str) -> pd.Series:
         return self.series[name].copy()
@@ -27,6 +32,75 @@ class MemoryStore:
 
 
 class StrategyEngineTests(unittest.TestCase):
+    def test_legacy_settings_get_default_drawdown_and_invalid_values_fall_back_per_asset(self):
+        self.assertEqual(
+            effective_drawdown_multipliers(MemoryStore({})),
+            {"nasdaq100": 1.0, "dividend_low_vol": 0.5, "gold": 0.0},
+        )
+        store = MemoryStore({}, settings={"drawdown_multipliers": {
+            "nasdaq100": float("nan"), "dividend_low_vol": -0.1, "gold": 0.25,
+        }})
+        self.assertEqual(effective_drawdown_multipliers(store), {
+            "nasdaq100": 1.0, "dividend_low_vol": 0.5, "gold": 0.25,
+        })
+
+    def test_custom_drawdown_applies_to_all_three_assets_and_conserves_funds(self):
+        index = pd.bdate_range("2024-01-01", periods=251)
+        below = pd.Series([100.0] * 250 + [96.0], index=index)
+        store = MemoryStore(
+            {asset: below for asset in MARKET_ASSETS},
+            settings={"drawdown_multipliers": {
+                "nasdaq100": 0.4, "dividend_low_vol": 0.2, "gold": 0.0,
+            }},
+        )
+        plan = calculate_plan(store, {"cash": 100000}, index[-1] + pd.Timedelta(days=1),
+                              use_crossing_history=True)
+        expected = {"nasdaq100": 0.2, "dividend_low_vol": 0.06, "gold": 0.0,
+                    "long_bond": 0.37, "cash": 0.37}
+        for asset, weight in expected.items():
+            self.assertAlmostEqual(plan["target_weights"][asset], weight)
+        self.assertAlmostEqual(sum(row["target_value"] for row in plan["rows"]), 100000)
+        self.assertAlmostEqual(sum(row["trade_value"] for row in plan["rows"]), 0)
+        self.assertIn("nasdaq100", plan["strategy"]["timing_assets"])
+        self.assertIsNotNone(plan["rows"][0]["market"]["ma250"])
+        self.assertEqual(plan["rows"][0]["signal_text"], "从高到低突破下轨，按回撤设置调整持仓")
+        self.assertEqual(plan["rows"][2]["signal_text"], "从高到低突破下轨，按回撤设置调整持仓")
+
+    def test_custom_state_survives_band_then_restores_after_upper_crossing(self):
+        index = pd.bdate_range("2024-01-01", periods=253)
+        for multiplier in (0.0, 0.25, 1.0):
+            with self.subTest(multiplier=multiplier):
+                series = pd.Series([100.0] * 250 + [96.0, 100.0, 104.0], index=index)
+                held = _trend_snapshot(series.iloc[:-1], 250, 0.03, None, multiplier, True)
+                restored = _trend_snapshot(series, 250, 0.03, None, multiplier, True)
+                self.assertEqual(held["multiplier"], multiplier)
+                self.assertEqual(restored["multiplier"], 1.0)
+                stored = _trend_snapshot(series.iloc[:-1], 250, 0.03, multiplier, multiplier)
+                self.assertEqual(stored["multiplier"], multiplier)
+
+    def test_nasdaq_missing_history_uses_bonds_when_custom_risk_control_enabled(self):
+        index = pd.bdate_range("2024-01-01", periods=251)
+        flat = pd.Series(100.0, index=index)
+        store = MemoryStore(
+            {asset: flat if asset != "nasdaq100" else flat.iloc[-100:] for asset in MARKET_ASSETS},
+            settings={"drawdown_multipliers": {"nasdaq100": 0.5}},
+        )
+        plan = calculate_plan(store, {"cash": 100000}, index[-1] + pd.Timedelta(days=1),
+                              use_crossing_history=True)
+        self.assertEqual(plan["target_weights"]["nasdaq100"], 0.0)
+        self.assertAlmostEqual(plan["target_weights"]["long_bond"], 0.55)
+
+    def test_saved_reduced_state_uses_new_percentage_inside_band(self):
+        index = pd.bdate_range("2024-01-01", periods=251)
+        flat = pd.Series(100.0, index=index)
+        store = MemoryStore(
+            {asset: flat for asset in MARKET_ASSETS},
+            calculation={"rows": [{"asset": "gold", "market": {"multiplier": 0.5}}]},
+            settings={"drawdown_multipliers": {"gold": 0.2}},
+        )
+        plan = calculate_plan(store, {"cash": 100000}, index[-1] + pd.Timedelta(days=1))
+        self.assertAlmostEqual(plan["target_weights"]["gold"], 0.02)
+
     def test_signal_text_distinguishes_strategy_state_from_holdings(self):
         self.assertEqual(
             _signal_text({"action": "hold_previous", "multiplier": 1.0}),
